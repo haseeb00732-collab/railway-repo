@@ -1,328 +1,517 @@
 """
-Invoice Editor Python Service v2
-- Pixel-perfect white-boxing using actual background color sampled from image
-- Collapse deleted product rows + shift totals block up
-- Re-render product table and totals in correct positions
-- Font matching via OCR height estimation
-Host on Railway / Render (free tier)
+Invoice Editor Service - FINAL VERSION
+Method: PyMuPDF (direct PDF editing) + Pillow fallback (for image inputs)
+Output: Always PDF
+Features:
+  - Reads exact font name/size/color from original PDF
+  - Redacts old text using PyMuPDF redaction API (pixel-perfect white box)
+  - Re-renders new text with same font metadata
+  - Collapses deleted product rows + shifts totals block up
+  - Converts image input to PDF if needed
+  - Always outputs PDF
 """
 
 from flask import Flask, request, jsonify, send_file
+import pymupdf
 from PIL import Image, ImageDraw, ImageFont
-import base64, io, os, json, traceback
+import base64, io, os, json, traceback, re
 
 app = Flask(__name__)
 
-# ─── Font Loader ──────────────────────────────────────────────────────────────
-
-FONT_CACHE = {}
-
-def get_font(size: int = 13, bold: bool = False) -> ImageFont.FreeTypeFont:
-    key = (size, bold)
-    if key in FONT_CACHE:
-        return FONT_CACHE[key]
-    candidates = (
-        [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-            "C:/Windows/Fonts/arialbd.ttf",
-        ] if bold else [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-            "C:/Windows/Fonts/arial.ttf",
-        ]
-    )
-    for path in candidates:
-        if os.path.exists(path):
-            try:
-                font = ImageFont.truetype(path, size)
-                FONT_CACHE[key] = font
-                return font
-            except Exception:
-                continue
-    font = ImageFont.load_default()
-    FONT_CACHE[key] = font
-    return font
-
-
 # ─── Color Helpers ────────────────────────────────────────────────────────────
 
-def hex_to_rgb(hex_color: str) -> tuple:
+def hex_to_rgb_float(hex_color: str) -> tuple:
+    """Convert #RRGGBB to (r, g, b) floats 0-1 for PyMuPDF."""
     h = hex_color.lstrip("#")
     if len(h) == 3:
         h = "".join(c * 2 for c in h)
     try:
-        return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+        r, g, b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+        return (r/255, g/255, b/255)
     except Exception:
         return (0, 0, 0)
 
+def int_color_to_hex(color_int: int) -> str:
+    """Convert PyMuPDF integer color to hex string."""
+    r = (color_int >> 16) & 0xFF
+    g = (color_int >> 8)  & 0xFF
+    b =  color_int        & 0xFF
+    return f"#{r:02x}{g:02x}{b:02x}"
 
-def sample_bg_color(img: Image.Image, x: int, y: int, radius: int = 5) -> tuple:
-    """
-    Sample the actual background color from the image at a given point.
-    Averages a small area to avoid hitting text pixels.
-    Falls back to white if out of bounds.
-    """
-    w, h = img.size
-    pixels = []
-    for dx in range(-radius, radius + 1):
-        for dy in range(-radius, radius + 1):
-            px, py = x + dx, y + dy
-            if 0 <= px < w and 0 <= py < h:
-                pixels.append(img.getpixel((px, py))[:3])
-    if not pixels:
-        return (255, 255, 255)
-    r = sum(p[0] for p in pixels) // len(pixels)
-    g = sum(p[1] for p in pixels) // len(pixels)
-    b = sum(p[2] for p in pixels) // len(pixels)
+def pymupdf_color(color_int: int) -> tuple:
+    """Convert PyMuPDF integer color to (r,g,b) floats."""
+    r = ((color_int >> 16) & 0xFF) / 255
+    g = ((color_int >> 8)  & 0xFF) / 255
+    b = ( color_int        & 0xFF) / 255
     return (r, g, b)
 
+# ─── Font Mapping ─────────────────────────────────────────────────────────────
 
-def measure_text(draw: ImageDraw.Draw, text: str, font: ImageFont.FreeTypeFont) -> tuple:
-    try:
-        bbox = draw.textbbox((0, 0), text, font=font)
-        return bbox[2] - bbox[0], bbox[3] - bbox[1]
-    except AttributeError:
-        return draw.textsize(text, font=font)
+# Map PDF font names to PyMuPDF built-in names
+FONT_MAP = {
+    "helvetica":        "helv",
+    "helvetica-bold":   "hebo",
+    "helvetica-oblique":"heit",
+    "helveticaneue":    "helv",
+    "arial":            "helv",
+    "arial-bold":       "hebo",
+    "arialmt":          "helv",
+    "arial-boldmt":     "hebo",
+    "times":            "tiro",
+    "times-roman":      "tiro",
+    "times-bold":       "tibo",
+    "timesnewroman":    "tiro",
+    "timesnewroman-bold":"tibo",
+    "courier":          "cour",
+    "courier-bold":     "cobo",
+    "calibri":          "helv",
+    "calibri-bold":     "hebo",
+    "verdana":          "helv",
+    "verdana-bold":     "hebo",
+    "trebuchet":        "helv",
+    "garamond":         "tiro",
+    "georgia":          "tiro",
+    "georgia-bold":     "tibo",
+}
 
+def map_font(pdf_font_name: str) -> str:
+    """Map a PDF font name to the closest PyMuPDF built-in."""
+    clean = pdf_font_name.lower().replace(" ", "").replace(",", "")
+    # Try direct match
+    if clean in FONT_MAP:
+        return FONT_MAP[clean]
+    # Try partial match
+    for key, val in FONT_MAP.items():
+        if key in clean:
+            return val
+    # Default
+    return "helv"
 
-# ─── Core Operations ─────────────────────────────────────────────────────────
+# ─── Number Formatting ────────────────────────────────────────────────────────
 
-def white_box(img: Image.Image, draw: ImageDraw.Draw,
-              x: int, y: int, w: int, h: int,
-              sample_x: int = None, sample_y: int = None) -> tuple:
+def format_currency(value: float, template: str) -> str:
     """
-    Erase a region by filling with the actual background color sampled from the image.
-    sample_x/y: where to sample bg color (defaults to just right of the box).
-    Returns the sampled color for reuse.
+    Format a number to match the original invoice's currency format.
+    template: e.g. "£1,250.00" or "$1.250,00"
     """
-    sx = sample_x if sample_x is not None else min(x + w + 10, img.width - 1)
-    sy = sample_y if sample_y is not None else y + h // 2
-    bg = sample_bg_color(img, sx, sy)
-    draw.rectangle([x, y, x + w, y + h], fill=bg)
-    return bg
+    # Detect currency symbol
+    symbol = ""
+    symbol_after = False
+    for ch in template:
+        if ch in "£$€¥₹₪₩฿":
+            symbol = ch
+            break
+    if template and template[-1] in "£$€¥₹₪₩฿":
+        symbol_after = True
 
-
-def render_text_in_box(draw: ImageDraw.Draw,
-                        text: str,
-                        x: int, y: int, box_w: int, box_h: int,
-                        font_size: int, bold: bool,
-                        text_color: str, align: str = "left",
-                        padding: int = 2):
-    """Render text inside a box with alignment and vertical centering."""
-    font = get_font(size=font_size, bold=bold)
-    tw, th = measure_text(draw, text, font)
-
-    # Vertical center
-    ty = y + max(padding, (box_h - th) // 2)
-
-    if align == "right":
-        tx = x + box_w - tw - padding
-    elif align == "center":
-        tx = x + (box_w - tw) // 2
+    # Detect decimal separator style
+    # European: 1.234,56  |  Standard: 1,234.56
+    if re.search(r'\d\.\d{3},\d{2}', template):
+        # European format
+        formatted = f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     else:
-        tx = x + padding
+        # Standard format
+        formatted = f"{value:,.2f}"
 
-    draw.text((tx, ty), text, fill=hex_to_rgb(text_color), font=font)
+    if symbol_after:
+        return formatted + symbol
+    return symbol + formatted
 
+# ─── PDF Editing (PyMuPDF) ────────────────────────────────────────────────────
 
-# ─── Main Edit Function ───────────────────────────────────────────────────────
-
-def process_invoice(image_b64: str, invoice_map: dict, user_products: list) -> str:
+def edit_pdf(pdf_bytes: bytes, invoice_map: dict, user_products: list) -> bytes:
     """
-    invoice_map from Claude:
-    {
-      "page_bg_color": "#FFFFFF",
-      "table_header": {
-        "y_px": 320, "height_px": 28,
-        "columns": [
-          {"label": "Description", "x_px": 40, "width_px": 280, "align": "left"},
-          {"label": "Qty",         "x_px": 320, "width_px": 60,  "align": "center"},
-          {"label": "Unit Price",  "x_px": 380, "width_px": 100, "align": "right"},
-          {"label": "Total",       "x_px": 480, "width_px": 100, "align": "right"}
-        ],
-        "font": {"size": 11, "bold": true, "color": "#FFFFFF"}
-      },
-      "product_rows": [
-        {
-          "row_index": 0,
-          "y_px": 348, "height_px": 26,
-          "cells": {
-            "product_name": {"x_px": 40,  "width_px": 280, "value": "Widget A", "align": "left"},
-            "quantity":     {"x_px": 320, "width_px": 60,  "value": "5",        "align": "center"},
-            "unit_price":   {"x_px": 380, "width_px": 100, "value": "£10.00",   "align": "right"},
-            "line_total":   {"x_px": 480, "width_px": 100, "value": "£50.00",   "align": "right"}
-          }
-        }
-      ],
-      "totals_block": {
-        "y_px": 500, "height_px": 80,
-        "rows": [
-          {"label": "Subtotal", "label_x": 380, "value_x": 480, "width_px": 100, "y_px": 500, "height_px": 22, "value": "£50.00", "align": "right"},
-          {"label": "VAT (20%)", ...},
-          {"label": "Total Due", ..., "bold": true}
-        ],
-        "font": {"size": 12, "bold": false, "color": "#333333"}
-      },
-      "simple_edits": [
-        {
-          "field": "invoice_number",
-          "new_value": "INV-9999",
-          "x_px": 620, "y_px": 138, "width_px": 180, "height_px": 22,
-          "font_size": 13, "bold": false,
-          "text_color": "#333333", "align": "right"
-        }
-      ]
-    }
-
-    user_products: list of dicts from the form, e.g.:
-    [{"Product_Name": "New Widget", "Quantity": "3", "Product_Price": "£25.00"}]
+    Edit a PDF using PyMuPDF.
+    - Reads exact font metadata from original
+    - Redacts old text regions
+    - Re-renders new text with same font/size/color
+    - Collapses rows + shifts totals
+    Returns edited PDF bytes.
     """
-
-    # Decode image
-    img_data = base64.b64decode(image_b64)
-    img = Image.open(io.BytesIO(img_data)).convert("RGB")
-    draw = ImageDraw.Draw(img)
-    img_w, img_h = img.size
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[0]  # Invoice is always page 1
+    page_rect = page.rect
 
     log = []
 
-    # ── STEP 1: Simple field edits (date, invoice_number, addresses etc.) ──────
-    for edit in invoice_map.get("simple_edits", []):
-        field     = edit.get("field", "unknown")
-        new_val   = str(edit.get("new_value", ""))
-        x         = int(edit["x_px"])
-        y         = int(edit["y_px"])
-        w         = int(edit["width_px"])
-        h         = int(edit["height_px"])
-        fsize     = int(edit.get("font_size", 13))
-        bold      = bool(edit.get("bold", False))
-        tcolor    = edit.get("text_color", "#333333")
-        align     = edit.get("align", "left")
+    # ── Build a font metadata index from the original PDF ─────────────────────
+    # Key: approximate y position → span metadata
+    # This lets us find the exact font used at any location
+    font_index = {}
+    blocks = page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_WHITESPACE)["blocks"]
+    for block in blocks:
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                y_key = round(span["bbox"][1])
+                font_index[y_key] = {
+                    "font":  span["font"],
+                    "size":  span["size"],
+                    "color": span["color"],
+                    "bbox":  span["bbox"]
+                }
 
-        # Sample bg from right of box (avoids text area)
-        bg = white_box(img, draw, x, y, w, h)
-        render_text_in_box(draw, new_val, x, y, w, h, fsize, bold, tcolor, align)
-        log.append(f"Simple edit '{field}' → '{new_val}' at ({x},{y})")
+    def get_font_at(y_px: float, fallback_size: float = 12) -> dict:
+        """Find the closest font metadata for a given y position."""
+        if not font_index:
+            return {"font": "helv", "size": fallback_size, "color": 0}
+        closest = min(font_index.keys(), key=lambda k: abs(k - y_px))
+        if abs(closest - y_px) < 30:
+            return font_index[closest]
+        return {"font": "helv", "size": fallback_size, "color": 0}
+
+    def redact_rect(rect: pymupdf.Rect, bg_color=(1,1,1)):
+        """Redact a rectangle with background color."""
+        annot = page.add_redact_annot(rect, fill=bg_color)
+        return annot
+
+    def render_text(x: float, y: float, text: str,
+                    fontname: str, fontsize: float,
+                    color: tuple, align: str = "left",
+                    box_width: float = None):
+        """Render text at position. Handles alignment within box_width."""
+        mapped_font = map_font(fontname)
+        if align == "right" and box_width:
+            # Measure text width to right-align
+            try:
+                tw = pymupdf.get_text_length(text, fontname=mapped_font, fontsize=fontsize)
+                x = x + box_width - tw
+            except Exception:
+                pass
+        elif align == "center" and box_width:
+            try:
+                tw = pymupdf.get_text_length(text, fontname=mapped_font, fontsize=fontsize)
+                x = x + (box_width - tw) / 2
+            except Exception:
+                pass
+        page.insert_text(
+            (x, y + fontsize),  # PyMuPDF y is baseline
+            text,
+            fontname=mapped_font,
+            fontsize=fontsize,
+            color=color
+        )
+
+    # ── STEP 1: Simple field edits ─────────────────────────────────────────────
+    for edit in invoice_map.get("simple_edits", []):
+        field    = edit.get("field", "unknown")
+        new_val  = str(edit.get("new_value", ""))
+        x        = float(edit.get("x_px", 0))
+        y        = float(edit.get("y_px", 0))
+        w        = float(edit.get("width_px", 200))
+        h        = float(edit.get("height_px", 20))
+        align    = edit.get("align", "left")
+
+        if not new_val:
+            continue
+
+        # Get exact font from original PDF at this location
+        font_meta = get_font_at(y)
+        fontname  = font_meta["font"]
+        fontsize  = font_meta["size"]
+        color     = pymupdf_color(font_meta["color"])
+
+        # Redact old text
+        rect = pymupdf.Rect(x - 2, y - 2, x + w + 4, y + h + 4)
+        redact_rect(rect)
+        page.apply_redactions()
+
+        # Re-render new text
+        render_text(x, y, new_val, fontname, fontsize, color, align, w)
+        log.append(f"✅ Simple edit '{field}' → '{new_val}'")
 
     # ── STEP 2: Product table rebuild ─────────────────────────────────────────
     product_rows  = invoice_map.get("product_rows", [])
-    user_prods    = user_products or []
     table_header  = invoice_map.get("table_header", {})
     totals_block  = invoice_map.get("totals_block", {})
+    row_font_meta = invoice_map.get("row_font", {})
 
-    if product_rows and user_prods:
-        # Determine row geometry from first existing row
-        first_row     = product_rows[0]
-        row_height    = int(first_row.get("height_px", 26))
-        first_row_y   = int(first_row.get("y_px", 0))
-        columns       = table_header.get("columns", [])
-        row_font      = invoice_map.get("row_font", {"size": 12, "bold": False, "color": "#333333"})
-        row_font_size = int(row_font.get("size", 12))
-        row_bold      = bool(row_font.get("bold", False))
-        row_color     = row_font.get("color", "#333333")
+    if product_rows and user_products:
+        first_row    = product_rows[0]
+        row_height   = float(first_row.get("height_px", 26))
+        first_row_y  = float(first_row.get("y_px", 0))
+        last_row     = product_rows[-1]
+        all_rows_end = float(last_row.get("y_px", 0)) + float(last_row.get("height_px", 26))
+        columns      = table_header.get("columns", [])
 
-        # White-box ALL existing product rows in one pass
-        all_rows_top    = int(product_rows[0]["y_px"])
-        all_rows_bottom = int(product_rows[-1]["y_px"]) + int(product_rows[-1]["height_px"])
-        table_x         = min(int(r.get("y_px", 40)) for r in columns) if columns else 30
-        # Use full image width for the wipe to be safe
-        bg_sample_x     = img_w - 20
-        bg_sample_y     = all_rows_top + 5
-        bg_color        = sample_bg_color(img, bg_sample_x, bg_sample_y)
-        draw.rectangle([0, all_rows_top, img_w, all_rows_bottom], fill=bg_color)
-        log.append(f"Wiped {len(product_rows)} original product rows ({all_rows_top}–{all_rows_bottom}px)")
+        # Get row font from original PDF
+        sample_y   = first_row_y + row_height / 2
+        font_meta  = get_font_at(sample_y)
+        fontname   = font_meta["font"]
+        fontsize   = font_meta["size"]
+        row_color  = pymupdf_color(font_meta["color"])
 
-        # Render user's products starting from first_row_y
+        # Wipe ALL original product rows in one redaction
+        wipe_rect = pymupdf.Rect(0, first_row_y - 2, page_rect.width, all_rows_end + 2)
+        page.add_redact_annot(wipe_rect, fill=(1, 1, 1))
+        page.apply_redactions()
+        log.append(f"🗑️ Wiped {len(product_rows)} original rows ({first_row_y:.0f}–{all_rows_end:.0f}px)")
+
+        # Re-render user products
         current_y = first_row_y
-        for i, prod in enumerate(user_prods):
-            name      = str(prod.get("Product_Name", ""))
-            qty       = str(prod.get("Quantity", ""))
-            price     = str(prod.get("Product_Price", ""))
-            # Calculate line total if both qty and price are numeric
+        for i, prod in enumerate(user_products):
+            name  = str(prod.get("Product_Name", "")).strip()
+            qty   = str(prod.get("Quantity", "")).strip()
+            price = str(prod.get("Product_Price", "")).strip()
+
+            # Auto-calculate line total
             try:
-                qty_num   = float(qty.replace(",", ""))
-                price_num = float(price.replace("£","").replace("$","").replace(",","").strip())
-                line_total = f"{price[0] if price and not price[0].isdigit() else '£'}{qty_num * price_num:,.2f}"
+                qty_num   = float(re.sub(r'[^\d.]', '', qty))
+                price_str = re.sub(r'[^\d.]', '', price)
+                price_num = float(price_str)
+                line_total = format_currency(qty_num * price_num, price)
             except Exception:
                 line_total = ""
 
-            # Map column labels to values
+            # Map values to column labels
             col_values = {
-                "Description": name, "Product": name, "Item": name, "Name": name,
-                "Qty": qty, "Quantity": qty,
-                "Unit Price": price, "Price": price, "Rate": price,
-                "Total": line_total, "Amount": line_total, "Line Total": line_total
+                "description": name, "product": name, "item": name,
+                "name": name, "details": name,
+                "qty": qty, "quantity": qty, "units": qty,
+                "unit price": price, "price": price, "rate": price,
+                "unit cost": price, "cost": price,
+                "total": line_total, "amount": line_total,
+                "line total": line_total, "subtotal": line_total
             }
 
-            # Render each cell
             for col in columns:
-                col_label = col.get("label", "")
-                col_x     = int(col.get("x_px", 0))
-                col_w     = int(col.get("width_px", 100))
+                col_label = col.get("label", "").lower()
+                col_x     = float(col.get("x_px", 0))
+                col_w     = float(col.get("width_px", 100))
                 col_align = col.get("align", "left")
-                # Match column to value
+
                 val = ""
                 for key, v in col_values.items():
-                    if key.lower() in col_label.lower():
+                    if key in col_label:
                         val = v
                         break
-                if val:
-                    render_text_in_box(draw, val, col_x, current_y, col_w, row_height,
-                                       row_font_size, row_bold, row_color, col_align)
 
-            log.append(f"Rendered row {i}: {name} × {qty} @ {price} = {line_total}")
+                if val:
+                    render_text(col_x, current_y, val, fontname, fontsize,
+                                row_color, col_align, col_w)
+
+            log.append(f"✅ Rendered row {i+1}: {name} × {qty} @ {price} = {line_total}")
             current_y += row_height
 
-        # ── STEP 3: Shift totals block up ──────────────────────────────────────
-        rows_rendered    = len(user_prods)
+        # ── STEP 3: Shift totals block up ────────────────────────────────────
+        rows_rendered    = len(user_products)
         rows_deleted     = len(product_rows) - rows_rendered
         vertical_savings = rows_deleted * row_height
 
         if rows_deleted > 0 and totals_block:
-            old_totals_y  = int(totals_block.get("y_px", 0))
-            totals_h      = int(totals_block.get("height_px", 80))
-            new_totals_y  = old_totals_y - vertical_savings
-            totals_font   = totals_block.get("font", {"size": 12, "bold": False, "color": "#333333"})
+            old_totals_y = float(totals_block.get("y_px", 0))
+            totals_h     = float(totals_block.get("height_px", 100))
+            new_totals_y = old_totals_y - vertical_savings
 
-            # White-box old totals location
-            draw.rectangle([0, old_totals_y, img_w, old_totals_y + totals_h], fill=bg_color)
+            # Snapshot totals content BEFORE wiping
+            totals_rows = totals_block.get("rows", [])
 
-            # Re-render totals rows at new position
-            for trow in totals_block.get("rows", []):
-                t_old_y   = int(trow.get("y_px", old_totals_y))
-                t_offset  = t_old_y - old_totals_y          # offset within block
-                t_new_y   = new_totals_y + t_offset
-                t_h       = int(trow.get("height_px", 22))
-                t_bold    = bool(trow.get("bold", totals_font.get("bold", False)))
-                t_fsize   = int(trow.get("font_size", totals_font.get("size", 12)))
-                t_color   = trow.get("color", totals_font.get("color", "#333333"))
-                lx        = int(trow.get("label_x", 0))
-                lw        = int(trow.get("label_width_px", 120))
-                vx        = int(trow.get("value_x", 0))
-                vw        = int(trow.get("width_px", 100))
-                label     = str(trow.get("label", ""))
-                value     = str(trow.get("value", ""))
-                align     = trow.get("align", "right")
+            # Wipe old totals location
+            wipe_totals = pymupdf.Rect(0, old_totals_y - 4,
+                                       page_rect.width, old_totals_y + totals_h + 4)
+            page.add_redact_annot(wipe_totals, fill=(1, 1, 1))
+            page.apply_redactions()
 
-                render_text_in_box(draw, label, lx, t_new_y, lw, t_h, t_fsize, t_bold, t_color, "left")
-                render_text_in_box(draw, value, vx, t_new_y, vw, t_h, t_fsize, t_bold, t_color, align)
+            # Re-render each totals row at shifted position
+            for trow in totals_rows:
+                t_old_y  = float(trow.get("y_px", old_totals_y))
+                t_offset = t_old_y - old_totals_y
+                t_new_y  = new_totals_y + t_offset
+                t_h      = float(trow.get("height_px", 22))
 
-            log.append(f"Shifted totals block up by {vertical_savings}px ({old_totals_y} → {new_totals_y})")
+                # Get font from original (by old y position)
+                t_meta   = get_font_at(t_old_y)
+                t_font   = t_meta["font"]
+                t_size   = t_meta["size"]
+                t_color  = pymupdf_color(t_meta["color"])
 
-    # ── Done: encode result ────────────────────────────────────────────────────
+                lx    = float(trow.get("label_x", 0))
+                lw    = float(trow.get("label_width_px", 120))
+                vx    = float(trow.get("value_x", 0))
+                vw    = float(trow.get("width_px", 100))
+                label = str(trow.get("label", ""))
+                value = str(trow.get("value", ""))
+                align = trow.get("align", "right")
+
+                if label:
+                    render_text(lx, t_new_y, label, t_font, t_size, t_color, "left", lw)
+                if value:
+                    render_text(vx, t_new_y, value, t_font, t_size, t_color, align, vw)
+
+            log.append(f"⬆️ Shifted totals up {vertical_savings:.0f}px "
+                       f"({old_totals_y:.0f} → {new_totals_y:.0f})")
+
+    # ── Save as PDF ────────────────────────────────────────────────────────────
     buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
+    doc.save(buf, garbage=4, deflate=True)
+    doc.close()
     buf.seek(0)
-    result_b64 = base64.b64encode(buf.read()).decode("utf-8")
-    return result_b64, log
+    return buf.read()
+
+
+# ─── Image → PDF fallback (Pillow + ReportLab-style via PyMuPDF) ─────────────
+
+def image_to_pdf_with_edits(image_b64: str, invoice_map: dict, user_products: list) -> bytes:
+    """
+    For image inputs: apply edits using Pillow white-box method,
+    then convert result to PDF using PyMuPDF.
+    Always outputs PDF.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    img_data = base64.b64decode(image_b64)
+    img = Image.open(io.BytesIO(img_data)).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    img_w, img_h = img.size
+    log = []
+
+    def hex_to_rgb(hex_color):
+        h = hex_color.lstrip("#")
+        if len(h) == 3: h = "".join(c*2 for c in h)
+        try: return tuple(int(h[i:i+2],16) for i in (0,2,4))
+        except: return (0,0,0)
+
+    def sample_bg(x, y, radius=5):
+        pixels = []
+        for dx in range(-radius, radius+1):
+            for dy in range(-radius, radius+1):
+                px, py = x+dx, y+dy
+                if 0 <= px < img_w and 0 <= py < img_h:
+                    pixels.append(img.getpixel((px,py))[:3])
+        if not pixels: return (255,255,255)
+        return tuple(sum(p[i] for p in pixels)//len(pixels) for i in range(3))
+
+    def get_font(size=13, bold=False):
+        candidates = ([
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        ] if bold else [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ])
+        for p in candidates:
+            if os.path.exists(p):
+                try: return ImageFont.truetype(p, size)
+                except: continue
+        return ImageFont.load_default()
+
+    def render_text_pil(x, y, w, h, text, fsize, bold, tcolor, align):
+        font = get_font(fsize, bold)
+        try:
+            bb = draw.textbbox((0,0), text, font=font)
+            tw, th = bb[2]-bb[0], bb[3]-bb[1]
+        except: tw, th = len(text)*fsize*0.6, fsize
+        ty = y + max(2, (h-th)//2)
+        if align == "right": tx = x + w - tw - 2
+        elif align == "center": tx = x + (w-tw)//2
+        else: tx = x + 2
+        draw.text((tx, ty), text, fill=hex_to_rgb(tcolor), font=font)
+
+    # Simple edits
+    for edit in invoice_map.get("simple_edits", []):
+        new_val = str(edit.get("new_value",""))
+        if not new_val: continue
+        x,y,w,h = int(edit["x_px"]),int(edit["y_px"]),int(edit["width_px"]),int(edit["height_px"])
+        fsize = int(edit.get("font_size",13))
+        bold  = bool(edit.get("bold",False))
+        tcolor= edit.get("text_color","#333333")
+        align = edit.get("align","left")
+        bg = sample_bg(min(x+w+10, img_w-1), y+h//2)
+        draw.rectangle([x-2,y-2,x+w+4,y+h+4], fill=bg)
+        render_text_pil(x,y,w,h,new_val,fsize,bold,tcolor,align)
+        log.append(f"✅ Image edit '{edit.get('field')}' → '{new_val}'")
+
+    # Product rows
+    product_rows = invoice_map.get("product_rows",[])
+    table_header = invoice_map.get("table_header",{})
+    totals_block = invoice_map.get("totals_block",{})
+    columns = table_header.get("columns",[])
+    row_font = invoice_map.get("row_font",{"size":12,"bold":False,"color":"#333333"})
+
+    if product_rows and user_products:
+        first_row   = product_rows[0]
+        row_height  = int(first_row.get("height_px",26))
+        first_row_y = int(first_row.get("y_px",0))
+        last_row    = product_rows[-1]
+        all_end     = int(last_row["y_px"]) + int(last_row["height_px"])
+
+        bg = sample_bg(img_w-20, first_row_y+5)
+        draw.rectangle([0,first_row_y-2,img_w,all_end+2], fill=bg)
+
+        current_y = first_row_y
+        for i, prod in enumerate(user_products):
+            name  = str(prod.get("Product_Name","")).strip()
+            qty   = str(prod.get("Quantity","")).strip()
+            price = str(prod.get("Product_Price","")).strip()
+            try:
+                q = float(re.sub(r'[^\d.]','',qty))
+                p = float(re.sub(r'[^\d.]','',price))
+                line_total = format_currency(q*p, price)
+            except: line_total = ""
+
+            col_values = {
+                "description":name,"product":name,"item":name,"name":name,
+                "qty":qty,"quantity":qty,"units":qty,
+                "unit price":price,"price":price,"rate":price,"cost":price,
+                "total":line_total,"amount":line_total,"line total":line_total
+            }
+            for col in columns:
+                lbl = col.get("label","").lower()
+                cx,cw,ca = int(col.get("x_px",0)),int(col.get("width_px",100)),col.get("align","left")
+                val = next((v for k,v in col_values.items() if k in lbl), "")
+                if val:
+                    render_text_pil(cx,current_y,cw,row_height,val,
+                                    int(row_font.get("size",12)),
+                                    bool(row_font.get("bold",False)),
+                                    row_font.get("color","#333333"),ca)
+            log.append(f"✅ Row {i+1}: {name}")
+            current_y += row_height
+
+        rows_deleted = len(product_rows) - len(user_products)
+        if rows_deleted > 0 and totals_block:
+            old_y  = int(totals_block.get("y_px",0))
+            t_h    = int(totals_block.get("height_px",100))
+            new_y  = old_y - rows_deleted * row_height
+            t_font = totals_block.get("font",{"size":12,"bold":False,"color":"#333333"})
+
+            draw.rectangle([0,old_y-4,img_w,old_y+t_h+4], fill=bg)
+            for trow in totals_block.get("rows",[]):
+                t_old = int(trow.get("y_px",old_y))
+                t_new = new_y + (t_old - old_y)
+                th    = int(trow.get("height_px",22))
+                lx,lw = int(trow.get("label_x",0)),int(trow.get("label_width_px",120))
+                vx,vw = int(trow.get("value_x",0)),int(trow.get("width_px",100))
+                bold  = bool(trow.get("bold", t_font.get("bold",False)))
+                fsize = int(trow.get("font_size", t_font.get("size",12)))
+                color = trow.get("color", t_font.get("color","#333333"))
+                if trow.get("label"):
+                    render_text_pil(lx,t_new,lw,th,trow["label"],fsize,bold,color,"left")
+                if trow.get("value"):
+                    render_text_pil(vx,t_new,vw,th,trow["value"],fsize,bold,color,trow.get("align","right"))
+            log.append(f"⬆️ Shifted totals up {rows_deleted*row_height}px")
+
+    # Convert edited image to PDF using PyMuPDF
+    img_buf = io.BytesIO()
+    img.save(img_buf, format="PNG")
+    img_buf.seek(0)
+
+    pdf_doc = pymupdf.open()
+    img_doc = pymupdf.open(stream=img_buf.read(), filetype="png")
+    pdfbytes = img_doc.convert_to_pdf()
+    img_doc.close()
+
+    result_doc = pymupdf.open("pdf", pdfbytes)
+    pdf_buf = io.BytesIO()
+    result_doc.save(pdf_buf, garbage=4, deflate=True)
+    result_doc.close()
+    pdf_buf.seek(0)
+    return pdf_buf.read(), log
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "invoice-editor-v2"})
+    return jsonify({"status": "ok", "service": "invoice-editor-final", "engine": "PyMuPDF"})
 
 
 @app.route("/edit", methods=["POST"])
@@ -330,36 +519,57 @@ def edit():
     """
     POST /edit
     {
-      "image_base64":  "<base64, no prefix>",
+      "pdf_base64":    "<base64 PDF bytes>",       // for PDF inputs
+      "image_base64":  "<base64 image bytes>",     // for image inputs
+      "file_type":     "pdf" | "image",            // which one to use
       "invoice_map":   { ...Claude's structural analysis... },
-      "user_products": [ {"Product_Name": "...", "Quantity": "...", "Product_Price": "..."} ]
+      "user_products": [ {Product_Name, Quantity, Product_Price}, ... ]
     }
+    Returns: { success, pdf_base64, log }
     """
     try:
         body = request.get_json(force=True)
         if not body:
             return jsonify({"success": False, "error": "No JSON body"}), 400
 
-        image_b64     = body.get("image_base64", "")
+        file_type     = body.get("file_type", "image")
         invoice_map   = body.get("invoice_map", {})
         user_products = body.get("user_products", [])
 
-        if not image_b64:
-            return jsonify({"success": False, "error": "Missing image_base64"}), 400
         if not invoice_map:
             return jsonify({"success": False, "error": "Missing invoice_map"}), 400
 
-        # Strip data URI prefix
-        if "," in image_b64:
-            image_b64 = image_b64.split(",", 1)[1]
+        print(f"\n📄 Processing {file_type} invoice with {len(user_products)} product(s)...")
 
-        result_b64, log = process_invoice(image_b64, invoice_map, user_products)
+        if file_type == "pdf":
+            pdf_b64 = body.get("pdf_base64", "")
+            if "," in pdf_b64:
+                pdf_b64 = pdf_b64.split(",",1)[1]
+            if not pdf_b64:
+                return jsonify({"success": False, "error": "Missing pdf_base64"}), 400
+
+            pdf_bytes = base64.b64decode(pdf_b64)
+            result_bytes = edit_pdf(pdf_bytes, invoice_map, user_products)
+            log = ["PDF edited with PyMuPDF — exact font matching"]
+
+        else:
+            # Image input → Pillow edit → convert to PDF
+            img_b64 = body.get("image_base64", "")
+            if "," in img_b64:
+                img_b64 = img_b64.split(",",1)[1]
+            if not img_b64:
+                return jsonify({"success": False, "error": "Missing image_base64"}), 400
+
+            result_bytes, log = image_to_pdf_with_edits(img_b64, invoice_map, user_products)
+
+        result_b64 = base64.b64encode(result_bytes).decode("utf-8")
+        print(f"✅ Done. Output: {len(result_bytes)} bytes PDF")
 
         return jsonify({
-            "success": True,
-            "edited_image_base64": result_b64,
-            "log": log,
-            "output_format": "png"
+            "success":    True,
+            "pdf_base64": result_b64,
+            "log":        log,
+            "output_format": "pdf"
         })
 
     except Exception as e:
@@ -369,24 +579,27 @@ def edit():
 
 @app.route("/preview", methods=["POST"])
 def preview():
-    """Same as /edit but returns the PNG file directly for browser testing."""
+    """Same as /edit but returns PDF file directly for browser testing."""
     try:
         body          = request.get_json(force=True)
-        image_b64     = body.get("image_base64", "")
-        invoice_map   = body.get("invoice_map", {})
-        user_products = body.get("user_products", [])
+        file_type     = body.get("file_type","image")
+        invoice_map   = body.get("invoice_map",{})
+        user_products = body.get("user_products",[])
 
-        if "," in image_b64:
-            image_b64 = image_b64.split(",", 1)[1]
-
-        result_b64, log = process_invoice(image_b64, invoice_map, user_products)
-        img_bytes = base64.b64decode(result_b64)
+        if file_type == "pdf":
+            pdf_b64 = body.get("pdf_base64","")
+            if "," in pdf_b64: pdf_b64 = pdf_b64.split(",",1)[1]
+            result_bytes = edit_pdf(base64.b64decode(pdf_b64), invoice_map, user_products)
+        else:
+            img_b64 = body.get("image_base64","")
+            if "," in img_b64: img_b64 = img_b64.split(",",1)[1]
+            result_bytes, _ = image_to_pdf_with_edits(img_b64, invoice_map, user_products)
 
         return send_file(
-            io.BytesIO(img_bytes),
-            mimetype="image/png",
+            io.BytesIO(result_bytes),
+            mimetype="application/pdf",
             as_attachment=True,
-            download_name="edited_invoice.png"
+            download_name="edited_invoice.pdf"
         )
     except Exception as e:
         traceback.print_exc()
@@ -395,5 +608,5 @@ def preview():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 Invoice Editor v2 on port {port}")
+    print(f"🚀 Invoice Editor FINAL on port {port} | Engine: PyMuPDF {pymupdf.__version__}")
     app.run(host="0.0.0.0", port=port, debug=False)
