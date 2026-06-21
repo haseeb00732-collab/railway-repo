@@ -573,8 +573,10 @@ def rebuild_table(page, tbl: dict, user_products: list,
         _push_totals_down(page, rows[-1]["y"] + rh + 2, push)
 
     # ── 3. Erase all original data rows ──────────────────────────────────────
+    # Use rh - 5 (not rh + 4) to avoid overwriting the grand total row
+    # when it sits immediately below the last product row
     y0_erase = rows[0]["y"] - 2
-    y1_erase = rows[-1]["y"] + rh + 4
+    y1_erase = rows[-1]["y"] + rh - 5
     page.add_redact_annot(
         pymupdf.Rect(20, y0_erase, page_w - 20, y1_erase),
         fill=(1, 1, 1)
@@ -761,11 +763,14 @@ def self_extract(page) -> dict:
     # European format detection
     eu = bool(re.search(r'\d\.\d{3},\d{2}', " ".join(s["text"] for s in all_spans)))
 
-    # Grand total: rightmost large number in lower half
+    # Grand total: LARGEST number in lower half (rightmost picks up product row totals)
     tot_cands = [s for s in all_spans
                  if s["y0"] > ph * 0.5 and s["x0"] > pw * 0.5
                  and re.search(r'\d{2,}[.,]\d{2}', s["text"])]
-    grand = re.sub(r'[^\d.,]', '', max(tot_cands, key=lambda s: s["x0"])["text"]) \
+    def _parse_num(t):
+        try: return float(re.sub(r'[^\d.]', '', t.replace(',', '')) or '0')
+        except: return 0.0
+    grand = re.sub(r'[^\d.,]', '', max(tot_cands, key=lambda s: _parse_num(s["text"]))["text"]) \
             if tot_cands else ""
 
     # Tax rate
@@ -776,14 +781,56 @@ def self_extract(page) -> dict:
             tax = float(m.group(1))
             break
 
-    # Addresses — use proportional positions
-    bill = [s["text"] for s in sorted(all_spans, key=lambda s: s["y0"])
-            if s["x0"] < pw * 0.35 and s["size"] < 9
-            and ph * 0.15 < s["y0"] < ph * 0.45]
+    # Addresses — anchor off Customer/Delivery label positions for clean extraction
+    CUST_KW  = ('customer', 'bill to', 'billed to', 'sold to', 'client')
+    DELV_KW  = ('delivery', 'ship to', 'shipping', 'deliver to', 'deliver address')
 
-    delv = [s["text"] for s in sorted(all_spans, key=lambda s: s["y0"])
-            if pw * 0.35 <= s["x0"] < pw * 0.72 and s["size"] < 9
-            and ph * 0.15 < s["y0"] < ph * 0.45]
+    def _label_y(keywords):
+        for s in sorted(all_spans, key=lambda x: x["y0"]):
+            if any(kw in s["text"].lower() for kw in keywords):
+                return s["y0"], s["x0"]
+        return None, None
+
+    table_header_y = next(
+        (s["y0"] for s in all_spans if s["text"].lower() in
+         ("sku","product","description","item","article","artikel")), ph * 0.45)
+
+    cust_y, cust_x = _label_y(CUST_KW)
+    delv_y, delv_x = _label_y(DELV_KW)
+
+    if cust_y is not None:
+        cy_start = cust_y + 4
+        cy_end   = min(table_header_y - 5, cy_start + 80)
+        bill = [s["text"] for s in sorted(all_spans, key=lambda s: s["y0"])
+                if cy_start <= s["y0"] <= cy_end
+                and s["x0"] < (delv_x if delv_x else pw * 0.4) - 5
+                and s["size"] < 10
+                and not any(kw in s["text"].lower() for kw in CUST_KW)]
+    else:
+        bill = [s["text"] for s in sorted(all_spans, key=lambda s: s["y0"])
+                if s["x0"] < pw * 0.35 and s["size"] < 9
+                and ph * 0.15 < s["y0"] < ph * 0.35]
+
+    # Find right-side invoice metadata column (Date, InvoiceNumber, Salesperson etc.)
+    # to cap the delivery address extraction before those labels
+    META_KW = ('invoicenumber', 'invoice number', 'salesperson', 'pagenumber',
+               'page number', 'vatnumber', 'vat number', 'ordernumber', 'order number')
+    meta_fields = [s for s in all_spans
+                   if any(kw in s["text"].lower().replace(' ','') for kw in META_KW)]
+    meta_x = min((s["x0"] for s in meta_fields), default=pw * 0.65)
+
+    if delv_y is not None:
+        dy_start = delv_y + 4
+        dy_end   = min(table_header_y - 5, dy_start + 80)
+        delv = [s["text"] for s in sorted(all_spans, key=lambda s: s["y0"])
+                if dy_start <= s["y0"] <= dy_end
+                and (delv_x - 5) <= s["x0"] < meta_x - 5
+                and s["size"] < 10
+                and not any(kw in s["text"].lower() for kw in DELV_KW + ('address',))]
+    else:
+        delv = [s["text"] for s in sorted(all_spans, key=lambda s: s["y0"])
+                if pw * 0.35 <= s["x0"] < pw * 0.65 and s["size"] < 9
+                and ph * 0.15 < s["y0"] < ph * 0.35]
 
     return {
         "invoice_number_value":   inv_num,
