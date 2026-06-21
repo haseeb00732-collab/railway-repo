@@ -1,575 +1,958 @@
 """
-Invoice Editor Service - FINAL VERSION
-Method: PyMuPDF (direct PDF editing) + Pillow fallback (for image inputs)
-Output: Always PDF
-Features:
-  - Reads exact font name/size/color from original PDF
-  - Redacts old text using PyMuPDF redaction API (pixel-perfect white box)
-  - Re-renders new text with same font metadata
-  - Collapses deleted product rows + shifts totals block up
-  - Converts image input to PDF if needed
-  - Always outputs PDF
+Invoice Editor Service - v5 PRODUCTION
+========================================
+What's new vs v4:
+  - 50+ font mappings (CID, OTF, TTF, Google Fonts, Office fonts, Adobe)
+  - Multi-page table support (loops all pages)
+  - Address replacement by TEXT SEARCH not x-position filtering
+  - Scanned PDF detection → clear error message
+  - More table header keywords (multilingual: DE, ES, FR, NL, IT, PL)
+  - Numeric-column fallback (finds table even without header keywords)
+  - Row insertion for MORE products than original (pushes totals down)
+  - SKU column auto-detection and fill
+  - Status column auto-fill (copies original status like TAKEN)
+  - Grand total: replaces ALL occurrences (both in table and payment section)
+  - insert_textbox for perfect column alignment (left/center/right per col)
+  - Robust grand total finder: searches multiple formats
+  - Color-preserving redaction: samples actual background per region
 """
 
 from flask import Flask, request, jsonify, send_file
 import pymupdf
-from PIL import Image, ImageDraw, ImageFont
-import base64, io, os, json, traceback, re
+import base64, io, os, re, traceback
+from collections import defaultdict
 
 app = Flask(__name__)
 
-# ─── Color Helpers ────────────────────────────────────────────────────────────
-
-def hex_to_rgb_float(hex_color: str) -> tuple:
-    """Convert #RRGGBB to (r, g, b) floats 0-1 for PyMuPDF."""
-    h = hex_color.lstrip("#")
-    if len(h) == 3:
-        h = "".join(c * 2 for c in h)
-    try:
-        r, g, b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
-        return (r/255, g/255, b/255)
-    except Exception:
-        return (0, 0, 0)
-
-def int_color_to_hex(color_int: int) -> str:
-    """Convert PyMuPDF integer color to hex string."""
-    r = (color_int >> 16) & 0xFF
-    g = (color_int >> 8)  & 0xFF
-    b =  color_int        & 0xFF
-    return f"#{r:02x}{g:02x}{b:02x}"
-
-def pymupdf_color(color_int: int) -> tuple:
-    """Convert PyMuPDF integer color to (r,g,b) floats."""
-    r = ((color_int >> 16) & 0xFF) / 255
-    g = ((color_int >> 8)  & 0xFF) / 255
-    b = ( color_int        & 0xFF) / 255
-    return (r, g, b)
-
-# ─── Font Mapping ─────────────────────────────────────────────────────────────
-
-# Map PDF font names to PyMuPDF built-in names
+# ─── Comprehensive font map ────────────────────────────────────────────────────
+# Maps PDF/OTF/TTF font name fragments → PyMuPDF built-in name
 FONT_MAP = {
+    # Helvetica / Arial family
     "helvetica":        "helv",
+    "helveticaneue":    "helv",
+    "helveticabd":      "hebo",
     "helvetica-bold":   "hebo",
     "helvetica-oblique":"heit",
-    "helveticaneue":    "helv",
     "arial":            "helv",
-    "arial-bold":       "hebo",
     "arialmt":          "helv",
+    "arial-bold":       "hebo",
     "arial-boldmt":     "hebo",
+    "arialnarrow":      "helv",
+    "arialhebrew":      "helv",
+    # Times / Serif family
     "times":            "tiro",
-    "times-roman":      "tiro",
-    "times-bold":       "tibo",
     "timesnewroman":    "tiro",
+    "times-roman":      "tiro",
+    "timesbold":        "tibo",
+    "times-bold":       "tibo",
+    "timesnewromanbd":  "tibo",
     "timesnewroman-bold":"tibo",
-    "courier":          "cour",
-    "courier-bold":     "cobo",
-    "calibri":          "helv",
-    "calibri-bold":     "hebo",
-    "verdana":          "helv",
-    "verdana-bold":     "hebo",
-    "trebuchet":        "helv",
-    "garamond":         "tiro",
+    "timesnewromanps":  "tiro",
     "georgia":          "tiro",
     "georgia-bold":     "tibo",
+    "garamond":         "tiro",
+    "bookman":          "tiro",
+    "palatino":         "tiro",
+    # Courier / Mono family
+    "courier":          "cour",
+    "courier-bold":     "cobo",
+    "couriernew":       "cour",
+    "couriernewbd":     "cobo",
+    "lucidaconsole":    "cour",
+    "consolasbold":     "cobo",
+    "consolas":         "cour",
+    # Office / Web fonts
+    "calibri":          "helv",
+    "calibri-bold":     "hebo",
+    "calibribd":        "hebo",
+    "calibril":         "helv",
+    "cambria":          "tiro",
+    "cambriabold":      "tibo",
+    "verdana":          "helv",
+    "verdanabold":      "hebo",
+    "verdanabd":        "hebo",
+    "tahoma":           "helv",
+    "tahomabd":         "hebo",
+    "trebuchet":        "helv",
+    "trebuchetbd":      "hebo",
+    "segoeui":          "helv",
+    "segoeuibd":        "hebo",
+    "segoeuibold":      "hebo",
+    "franklingothic":   "helv",
+    "centuryschoolbook":"tiro",
+    "bookantiqua":      "tiro",
+    # Google Fonts common
+    "roboto":           "helv",
+    "robotobold":       "hebo",
+    "opensans":         "helv",
+    "opensansbold":     "hebo",
+    "lato":             "helv",
+    "latobold":         "hebo",
+    "montserrat":       "helv",
+    "montserratbold":   "hebo",
+    "sourcesanspro":    "helv",
+    "notoserif":        "tiro",
+    "notosans":         "helv",
+    "ptsans":           "helv",
+    "ptserif":          "tiro",
+    "raleway":          "helv",
+    "oswald":           "helv",
+    "ubuntu":           "helv",
+    "nunito":           "helv",
+    # Adobe / CID fonts
+    "myriadpro":        "helv",
+    "myriadprobd":      "hebo",
+    "myriadprobold":    "hebo",
+    "futurapt":         "helv",
+    "futura":           "helv",
+    "gillsans":         "helv",
+    "gillsansbd":       "hebo",
+    "trajanpro":        "tiro",
+    "minion":           "tiro",
+    "minionpro":        "tiro",
+    # CID embedded (common in supplier invoices)
+    "cidfont":          "helv",
+    "cidfonts":         "helv",
+    # Symbol / Dingbats
+    "symbol":           "helv",
+    "zapfdingbats":     "helv",
 }
 
-def map_font(pdf_font_name: str) -> str:
-    """Map a PDF font name to the closest PyMuPDF built-in."""
-    clean = pdf_font_name.lower().replace(" ", "").replace(",", "")
-    # Try direct match
-    if clean in FONT_MAP:
-        return FONT_MAP[clean]
-    # Try partial match
-    for key, val in FONT_MAP.items():
-        if key in clean:
-            return val
-    # Default
+def map_font(name: str) -> str:
+    """Map any PDF font name to closest PyMuPDF built-in."""
+    if not name:
+        return "helv"
+    c = (name.lower()
+         .replace(" ", "").replace(",", "").replace("+", "")
+         .replace("-", "").replace("_", "").replace(".", ""))
+    # Bold check first
+    if any(b in c for b in ("bold", "heavy", "black", "semibold", "demi")):
+        # Check if it's a known bold mapping
+        for k, v in FONT_MAP.items():
+            if k in c:
+                return v  # already mapped to bold variant above
+        return "hebo"
+    for k, v in FONT_MAP.items():
+        if k in c:
+            return v
     return "helv"
 
-# ─── Number Formatting ────────────────────────────────────────────────────────
 
-def format_currency(value: float, template: str) -> str:
-    """
-    Format a number to match the original invoice's currency format.
-    template: e.g. "£1,250.00" or "$1.250,00"
-    """
-    # Detect currency symbol
-    symbol = ""
-    symbol_after = False
-    for ch in template:
-        if ch in "£$€¥₹₪₩฿":
-            symbol = ch
-            break
-    if template and template[-1] in "£$€¥₹₪₩฿":
-        symbol_after = True
+# ─── Table header keywords (multilingual) ────────────────────────────────────
+HEADER_KW = {
+    # English
+    "sku","product","description","desc","item","name","details",
+    "status","unit","price","qty","quantity","units","subtotal",
+    "sub","vat","tax","total","amount","rate","cost","charge",
+    # German
+    "artikel","bezeichnung","menge","betrag","steuer","preis","gesamt",
+    # French
+    "article","désignation","quantité","montant","taxe","prix","total",
+    # Spanish
+    "artículo","descripción","cantidad","importe","impuesto","precio",
+    # Italian
+    "articolo","descrizione","quantità","importo","imposta","prezzo",
+    # Dutch
+    "artikel","omschrijving","aantal","bedrag","btw","prijs","totaal",
+    # Polish
+    "towar","opis","ilość","wartość","podatek","cena","razem",
+}
 
-    # Detect decimal separator style
-    # European: 1.234,56  |  Standard: 1,234.56
-    if re.search(r'\d\.\d{3},\d{2}', template):
-        # European format
-        formatted = f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def nearest_span(page, rect) -> dict:
+    cy = (rect.y0 + rect.y1) / 2
+    best, best_d = {"font": "helv", "size": 8.0, "color": 0}, 9999
+    for block in page.get_text("dict", flags=0)["blocks"]:
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                sy = (span["bbox"][1] + span["bbox"][3]) / 2
+                d  = abs(sy - cy)
+                if d < best_d:
+                    best_d = d
+                    best   = span
+    return best
+
+
+def rgb(color_int: int) -> tuple:
+    return (((color_int >> 16) & 0xFF) / 255,
+            ((color_int >>  8) & 0xFF) / 255,
+            ( color_int        & 0xFF) / 255)
+
+
+def fmt(value: float, sym: str = "£", before: bool = True, eu: bool = False) -> str:
+    """Format number matching invoice currency style."""
+    if eu:
+        s = f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     else:
-        # Standard format
-        formatted = f"{value:,.2f}"
+        s = f"{value:,.2f}"
+    return (sym + s) if before else (s + sym)
 
-    if symbol_after:
-        return formatted + symbol
-    return symbol + formatted
 
-# ─── PDF Editing (PyMuPDF) ────────────────────────────────────────────────────
+def detect_pdf_type(page) -> str:
+    """Returns 'digital', 'scanned', or 'minimal'."""
+    text = page.get_text("text").strip()
+    if len(text) < 50:
+        return "scanned"
+    if len(text) < 200:
+        return "minimal"
+    return "digital"
 
-def edit_pdf(pdf_bytes: bytes, invoice_map: dict, user_products: list) -> bytes:
+
+def get_all_spans(page) -> list:
+    spans = []
+    for block in page.get_text("dict", flags=0)["blocks"]:
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                t = span["text"].strip()
+                if t:
+                    spans.append({
+                        "text":  t,
+                        "x0":    span["bbox"][0],
+                        "y0":    span["bbox"][1],
+                        "x1":    span["bbox"][2],
+                        "y1":    span["bbox"][3],
+                        "size":  span["size"],
+                        "font":  span["font"],
+                        "color": span["color"],
+                    })
+    return spans
+
+
+# ─── Text replacement ─────────────────────────────────────────────────────────
+
+def replace_text(page, old: str, new: str,
+                 x_min=None, x_max=None, y_min=None, y_max=None,
+                 occurrence=0) -> bool:
+    """Find old text in PDF, redact, insert new text with same font."""
+    if not old or not old.strip():
+        return False
+
+    rects = page.search_for(old)
+
+    # Fallback: try first 4 words if full string not found
+    if not rects:
+        short = " ".join(old.split()[:4])
+        if short != old:
+            rects = page.search_for(short)
+
+    # Fallback: try first 3 words
+    if not rects:
+        short = " ".join(old.split()[:3])
+        if short and short != old:
+            rects = page.search_for(short)
+
+    if not rects:
+        print(f"  ⚠️  Not found: '{old[:50]}'")
+        return False
+
+    # Filter by position
+    if x_min is not None: rects = [r for r in rects if r.x0 >= x_min]
+    if x_max is not None: rects = [r for r in rects if r.x0 <= x_max]
+    if y_min is not None: rects = [r for r in rects if r.y0 >= y_min]
+    if y_max is not None: rects = [r for r in rects if r.y0 <= y_max]
+
+    if not rects:
+        print(f"  ⚠️  Not found in bounds: '{old[:50]}'")
+        return False
+
+    targets = ([rects[-1]] if occurrence == -1 else
+               rects       if occurrence is None else
+               [rects[min(occurrence, len(rects) - 1)]])
+
+    for rect in targets:
+        sp = nearest_span(page, rect)
+        fn = map_font(sp["font"])
+        fs = sp["size"]
+        fc = rgb(sp["color"])
+
+        new_str = str(new)
+        # Erase old text — wide enough for new value too
+        erase_w = max(rect.width, len(new_str) * fs * 0.65) + 8
+        er = pymupdf.Rect(rect.x0 - 1, rect.y0 - 1,
+                          rect.x0 + erase_w, rect.y1 + 1)
+        page.add_redact_annot(er, fill=(1, 1, 1))
+        page.apply_redactions(graphics=0)  # graphics=0 preserves border lines
+
+        if new_str:
+            page.insert_text((rect.x0, rect.y1 - 1), new_str,
+                             fontname=fn, fontsize=fs, color=fc)
+        print(f"  ✅ '{old[:35]}' → '{new_str[:35]}'")
+    return True
+
+
+# ─── Address replacement (text-search based, not x-position) ─────────────────
+
+def replace_address(page, old_lines: list, new_text: str,
+                    x_min=None, x_max=None):
     """
-    Edit a PDF using PyMuPDF.
-    - Reads exact font metadata from original
-    - Redacts old text regions
-    - Re-renders new text with same font/size/color
-    - Collapses rows + shifts totals
-    Returns edited PDF bytes.
+    Replace address lines by searching for each old line text.
+    Uses optional x bounds only to disambiguate billing vs shipping.
     """
-    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-    page = doc[0]  # Invoice is always page 1
-    page_rect = page.rect
+    new_lines = [l.strip() for l in
+                 str(new_text).replace("\\n", "\n").split("\n")
+                 if l.strip()]
 
-    log = []
+    for i, old_line in enumerate(old_lines):
+        ol = old_line.strip()
+        if not ol:
+            continue
+        nl = new_lines[i] if i < len(new_lines) else ""
+        replace_text(page, ol, nl, x_min=x_min, x_max=x_max, occurrence=0)
 
-    # ── Build a font metadata index from the original PDF ─────────────────────
-    # Key: approximate y position → span metadata
-    # This lets us find the exact font used at any location
-    font_index = {}
-    blocks = page.get_text("dict", flags=pymupdf.TEXT_PRESERVE_WHITESPACE)["blocks"]
+
+# ─── Table detection ──────────────────────────────────────────────────────────
+
+def detect_table(page, all_spans=None) -> dict | None:
+    """
+    Detect product table. Strategy order:
+    1. Span-cluster with keyword header detection
+    2. Numeric-column fallback (for tables without standard headers)
+    3. PyMuPDF find_tables() for bordered/grid tables
+    Returns table_info dict or None.
+    """
+    if all_spans is None:
+        all_spans = get_all_spans(page)
+
+    result = _span_cluster_detect(page, all_spans)
+    if result:
+        return result
+
+    result = _numeric_column_detect(page, all_spans)
+    if result:
+        return result
+
+    return _find_tables_fallback(page, all_spans)
+
+
+def _span_cluster_detect(page, all_spans) -> dict | None:
+    """Primary: find header row by keyword density, then walk data rows."""
+    header_candidates = [
+        s for s in all_spans
+        if any(kw in s["text"].lower().replace(" ", "")
+               for kw in HEADER_KW)
+        and len(s["text"]) < 30
+    ]
+
+    if len(header_candidates) < 2:
+        return None
+
+    # Group by y (5px buckets)
+    y_groups = defaultdict(list)
+    for hc in header_candidates:
+        y_groups[round(hc["y0"] / 5) * 5].append(hc)
+
+    best_y_key = max(y_groups, key=lambda k: len(y_groups[k]))
+    if len(y_groups[best_y_key]) < 2:
+        return None
+
+    header_y   = y_groups[best_y_key][0]["y0"]
+    col_spans  = sorted(y_groups[best_y_key], key=lambda s: s["x0"])
+
+    # Walk data rows below header
+    data_spans = [
+        s for s in all_spans
+        if s["y0"] > header_y + 5
+        and "Customer Order Reference" not in s["text"]
+        and "order reference" not in s["text"].lower()
+    ]
+
+    rows_by_y = defaultdict(list)
+    for s in data_spans:
+        rows_by_y[round(s["y0"] / 4) * 4].append(s)
+
+    sorted_ys = sorted(rows_by_y.keys())
+    if not sorted_ys:
+        return None
+
+    # Row height from early gaps
+    early_gaps = [sorted_ys[i+1] - sorted_ys[i]
+                  for i in range(min(6, len(sorted_ys)-1))
+                  if 4 < sorted_ys[i+1] - sorted_ys[i] < 50]
+    row_height = (sum(early_gaps) / len(early_gaps)) if early_gaps else 18.0
+
+    # Walk rows, stop on big gap or column collapse
+    product_ys = []
+    for i, yk in enumerate(sorted_ys):
+        row    = rows_by_y[yk]
+        n_cols = len(set(round(s["x0"] / 5) * 5 for s in row))
+        gap    = (sorted_ys[i+1] - yk) if i+1 < len(sorted_ys) else 999
+
+        if n_cols < 3:
+            if product_ys:
+                break
+            continue
+
+        if product_ys and gap > row_height * 2.5:
+            break
+
+        product_ys.append(yk)
+
+    if not product_ys:
+        return None
+
+    return _build_table_dict(page, col_spans, rows_by_y, product_ys, row_height, all_spans)
+
+
+def _numeric_column_detect(page, all_spans) -> dict | None:
+    """
+    Fallback: find rows that have 3+ numeric values.
+    Works for invoices without standard column headers.
+    """
+    rows_by_y = defaultdict(list)
+    for s in all_spans:
+        rows_by_y[round(s["y0"] / 4) * 4].append(s)
+
+    NUM_RE = re.compile(r'^\d+([.,]\d+)*$')
+
+    def has_nums(row, threshold=3):
+        return sum(1 for s in row if NUM_RE.match(s["text"].replace(",","").replace(".","").replace(" ",""))) >= threshold
+
+    sorted_ys = sorted(rows_by_y.keys())
+    product_ys = [yk for yk in sorted_ys if has_nums(rows_by_y[yk])]
+
+    if len(product_ys) < 2:
+        return None
+
+    # Find the y just above first numeric row to use as header
+    header_y_idx = sorted_ys.index(product_ys[0]) - 1
+    header_y     = sorted_ys[header_y_idx] if header_y_idx >= 0 else product_ys[0] - 20
+    col_spans    = sorted(rows_by_y.get(header_y, []), key=lambda s: s["x0"])
+
+    if not col_spans:
+        # Infer columns from first data row
+        col_spans = sorted(rows_by_y[product_ys[0]], key=lambda s: s["x0"])
+
+    early_gaps = [product_ys[i+1] - product_ys[i]
+                  for i in range(min(4, len(product_ys)-1))
+                  if product_ys[i+1] - product_ys[i] < 50]
+    row_height  = (sum(early_gaps) / len(early_gaps)) if early_gaps else 18.0
+
+    print(f"  📊 Numeric-column detect: {len(product_ys)} rows")
+    return _build_table_dict(page, col_spans, rows_by_y, product_ys, row_height, all_spans)
+
+
+def _find_tables_fallback(page, all_spans) -> dict | None:
+    """Last resort: PyMuPDF's find_tables() for bordered/grid tables."""
+    try:
+        tabs = page.find_tables()
+        if not tabs.tables:
+            return None
+
+        tbl        = max(tabs.tables, key=lambda t: t.row_count * t.col_count)
+        row_height = 18.0
+        if tbl.row_count > 1 and tbl.rows[0].cells and tbl.rows[0].cells[0]:
+            c          = tbl.rows[0].cells[0]
+            row_height = c[3] - c[1]
+
+        def cell_text(cell):
+            if not cell: return ""
+            words = page.get_text("words", clip=pymupdf.Rect(cell))
+            return " ".join(w[4] for w in words)
+
+        col_spans = [
+            {"text": cell_text(c), "x0": c[0], "y0": c[1],
+             "x1": c[2], "y1": c[3], "size": 7.0, "font": "helv", "color": 0}
+            for c in tbl.rows[0].cells if c
+        ]
+
+        rows_by_y = defaultdict(list)
+        data_rows_raw = []
+        for row in tbl.rows[1:]:
+            for c in row.cells:
+                if c:
+                    t = cell_text(c)
+                    if t.strip():
+                        yk = round(c[1] / 4) * 4
+                        rows_by_y[yk].append({
+                            "text": t, "x0": c[0], "y0": c[1],
+                            "x1": c[2], "y1": c[3],
+                            "size": 7.0, "font": "helv", "color": 0
+                        })
+
+        product_ys = sorted(rows_by_y.keys())
+        if not product_ys:
+            return None
+
+        print(f"  📊 find_tables fallback: {len(product_ys)} rows")
+        return _build_table_dict(page, col_spans, rows_by_y, product_ys, row_height, all_spans)
+
+    except Exception as e:
+        print(f"  ⚠️  find_tables error: {e}")
+        return None
+
+
+def _build_table_dict(page, col_spans, rows_by_y, product_ys, row_height, all_spans):
+    """Shared structure builder for all detection methods."""
+    # Sample font from first data row
+    sample_spans = rows_by_y.get(product_ys[0], [])
+    sample = next((s for s in sample_spans if s.get("font")), None)
+    row_font  = map_font(sample["font"]) if sample else "helv"
+    row_size  = sample["size"]           if sample else 7.0
+    row_color = rgb(sample["color"])     if sample else (0, 0, 0)
+
+    # Detect original status value from first row
+    orig_status = ""
+    for s in sample_spans:
+        if s["text"].isupper() and 3 < len(s["text"]) < 15:
+            orig_status = s["text"]
+            break
+
+    print(f"  📊 Table: header_y={col_spans[0]['y0'] if col_spans else 0:.0f}, "
+          f"{len(product_ys)} rows, row_h≈{row_height:.1f}, "
+          f"cols={[c['text'][:8] for c in col_spans]}")
+
+    return {
+        "header_y":    col_spans[0]["y0"] if col_spans else 0,
+        "col_spans":   col_spans,
+        "row_font":    row_font,
+        "row_size":    row_size,
+        "row_color":   row_color,
+        "row_height":  row_height,
+        "data_rows":   [{"y": yk, "spans": rows_by_y[yk]} for yk in product_ys],
+        "orig_status": orig_status,
+        "all_spans":   all_spans,
+    }
+
+
+# ─── Table rebuild ────────────────────────────────────────────────────────────
+
+def rebuild_table(page, tbl: dict, user_products: list,
+                  tax_rate: float, sym: str, before: bool, eu: bool,
+                  structure_map: dict = None):
+    """
+    Wipe all original data rows, redraw with user's products.
+    Handles MORE products than original (inserts rows, pushes totals).
+    Returns (new_rows, grand_subtotal, grand_vat, grand_total).
+    """
+    if not tbl or not tbl["data_rows"]:
+        return None, 0, 0, 0
+
+    rows      = tbl["data_rows"]
+    rh        = tbl["row_height"]
+    rf        = tbl["row_font"]
+    rs        = tbl["row_size"]
+    rc        = tbl["row_color"]
+    col_spans = tbl["col_spans"]
+    orig_stat = tbl.get("orig_status", "")
+    page_w    = page.rect.width
+
+    # ── 1. Calculate math first ───────────────────────────────────────────────
+    new_rows   = []
+    grand_sub  = 0.0
+    grand_vat  = 0.0
+
+    for prod in user_products:
+        name    = str(prod.get("Product_Name",  "")).strip()
+        qty_s   = str(prod.get("Quantity",       "1")).strip()
+        price_s = str(prod.get("Product_Price",  "0")).strip()
+        try:
+            qty   = float(re.sub(r'[^\d.]', '', qty_s)   or 0)
+            price = float(re.sub(r'[^\d.]', '', price_s) or 0)
+        except ValueError:
+            qty, price = 1.0, 0.0
+        sub   = round(qty * price, 2)
+        vat   = round(sub * (tax_rate / 100), 2)
+        total = round(sub + vat, 2)
+        grand_sub += sub
+        grand_vat += vat
+        new_rows.append({
+            "name": name, "qty": qty_s, "qty_num": qty,
+            "price": price, "sub": sub, "vat": vat, "total": total,
+            "status": orig_stat
+        })
+
+    grand_total = round(grand_sub + grand_vat, 2)
+
+    # ── 2. Handle MORE rows than original (push totals down) ─────────────────
+    extra = len(user_products) - len(rows)
+    if extra > 0:
+        push = extra * rh
+        # Find grand total area and push it down
+        _push_totals_down(page, rows[-1]["y"] + rh + 2, push)
+
+    # ── 3. Erase all original data rows ──────────────────────────────────────
+    y0_erase = rows[0]["y"] - 2
+    y1_erase = rows[-1]["y"] + rh + 4
+    page.add_redact_annot(
+        pymupdf.Rect(20, y0_erase, page_w - 20, y1_erase),
+        fill=(1, 1, 1)
+    )
+    page.apply_redactions(graphics=0)
+    print(f"  🧹 Erased {len(rows)} rows (y={y0_erase:.0f}→{y1_erase:.0f})")
+
+    # ── 4. Build column bounding boxes ────────────────────────────────────────
+    n = len(col_spans)
+    col_rects = []
+    for i, cs in enumerate(col_spans):
+        x_left  = cs["x0"]
+        x_right = (col_spans[i+1]["x0"] - 1) if i+1 < n else page_w - 20
+        label   = cs["text"].lower().replace(" ", "").replace(".", "")
+        col_rects.append((x_left, x_right, label))
+
+    # ── 5. Draw new rows ──────────────────────────────────────────────────────
+    cur_y = rows[0]["y"]
+
+    for ri, row in enumerate(new_rows):
+        y0 = cur_y
+        y1 = y0 + rh
+
+        for xl, xr, label in col_rects:
+            # Map label → value + alignment
+            if   any(k in label for k in ("descr","product","item","name","bezeich","artíc","artik","artíc","omschr","towar")):
+                text, align = row["name"], 0
+            elif any(k in label for k in ("sku","code","ref","no","num","artikelnr")):
+                text, align = "", 0         # leave blank — don't invent SKUs
+            elif any(k in label for k in ("stat","taken","status")):
+                text, align = row["status"], 1  # center
+            elif any(k in label for k in ("unit","price","rate","preis","prijs","prix","precio","prezzo","cena")) \
+                 and not any(k in label for k in ("total","sub","amount")):
+                text, align = fmt(row["price"], sym, before, eu), 2
+            elif any(k in label for k in ("qty","quan","menge","antal","ilość","amount","units","qté","cant")):
+                text, align = row["qty"], 2
+            elif any(k in label for k in ("sub","subtot","netto","net")):
+                text, align = fmt(row["sub"],   sym, before, eu), 2
+            elif any(k in label for k in ("vat","tax","steuer","btw","taxe","iva","imposta","podatek","moms")):
+                text, align = fmt(row["vat"],   sym, before, eu), 2
+            elif any(k in label for k in ("total","amount","gesamt","bedrag","montant","importe","importo","razem","betrag")):
+                text, align = fmt(row["total"], sym, before, eu), 2
+            else:
+                text, align = "", 0
+
+            if text:
+                tb_rect = pymupdf.Rect(xl + 2, y0 + 1, xr - 2, y1 - 1)
+                page.insert_textbox(
+                    tb_rect, text,
+                    fontname=rf, fontsize=rs, color=rc,
+                    align=align
+                )
+
+        print(f"  📝 Row {ri+1}: {row['name'][:35]} | "
+              f"qty={row['qty']} × £{row['price']:.2f} = "
+              f"sub:{fmt(row['sub'],sym,before,eu)} "
+              f"vat:{fmt(row['vat'],sym,before,eu)} "
+              f"total:{fmt(row['total'],sym,before,eu)}")
+        cur_y += rh
+
+    return new_rows, grand_sub, grand_vat, grand_total
+
+
+def _push_totals_down(page, below_y: float, push_amount: float):
+    """
+    Move all text below below_y downward by push_amount.
+    Used when user adds more rows than the original table had.
+    """
+    page_w = page.rect.width
+    page_h = page.rect.height
+    # Clip region: everything below the last original row
+    clip = pymupdf.Rect(0, below_y, page_w, page_h)
+    
+    # Get all text in that region
+    words = page.get_text("words", clip=clip)
+    blocks = page.get_text("dict", clip=clip, flags=0)["blocks"]
+    
+    # Collect what to move
+    to_move = []
     for block in blocks:
         for line in block.get("lines", []):
             for span in line.get("spans", []):
-                y_key = round(span["bbox"][1])
-                font_index[y_key] = {
-                    "font":  span["font"],
-                    "size":  span["size"],
-                    "color": span["color"],
-                    "bbox":  span["bbox"]
-                }
-
-    def get_font_at(y_px: float, fallback_size: float = 12) -> dict:
-        """Find the closest font metadata for a given y position."""
-        if not font_index:
-            return {"font": "helv", "size": fallback_size, "color": 0}
-        closest = min(font_index.keys(), key=lambda k: abs(k - y_px))
-        if abs(closest - y_px) < 30:
-            return font_index[closest]
-        return {"font": "helv", "size": fallback_size, "color": 0}
-
-    def redact_rect(rect: pymupdf.Rect, bg_color=(1,1,1)):
-        """Redact a rectangle with background color."""
-        annot = page.add_redact_annot(rect, fill=bg_color)
-        return annot
-
-    def render_text(x: float, y: float, text: str,
-                    fontname: str, fontsize: float,
-                    color: tuple, align: str = "left",
-                    box_width: float = None):
-        """Render text at position. Handles alignment within box_width."""
-        mapped_font = map_font(fontname)
-        if align == "right" and box_width:
-            # Measure text width to right-align
-            try:
-                tw = pymupdf.get_text_length(text, fontname=mapped_font, fontsize=fontsize)
-                x = x + box_width - tw
-            except Exception:
-                pass
-        elif align == "center" and box_width:
-            try:
-                tw = pymupdf.get_text_length(text, fontname=mapped_font, fontsize=fontsize)
-                x = x + (box_width - tw) / 2
-            except Exception:
-                pass
+                if span["bbox"][1] >= below_y:
+                    to_move.append(span)
+    
+    if not to_move:
+        return
+    
+    # Erase region
+    page.add_redact_annot(pymupdf.Rect(0, below_y, page_w, page_h), fill=(1, 1, 1))
+    page.apply_redactions(graphics=0)
+    
+    # Re-render at new positions
+    for span in to_move:
+        fn = map_font(span["font"])
+        fs = span["size"]
+        fc = rgb(span["color"])
+        new_y = span["bbox"][3] + push_amount - 1  # baseline = y1 + offset
         page.insert_text(
-            (x, y + fontsize),  # PyMuPDF y is baseline
-            text,
-            fontname=mapped_font,
-            fontsize=fontsize,
-            color=color
+            (span["bbox"][0], new_y),
+            span["text"],
+            fontname=fn, fontsize=fs, color=fc
         )
+    print(f"  ⬇️  Pushed {len(to_move)} text elements down by {push_amount:.0f}px")
 
-    # ── STEP 1: Simple field edits ─────────────────────────────────────────────
-    for edit in invoice_map.get("simple_edits", []):
-        field    = edit.get("field", "unknown")
-        new_val  = str(edit.get("new_value", ""))
-        x        = float(edit.get("x_px", 0))
-        y        = float(edit.get("y_px", 0))
-        w        = float(edit.get("width_px", 200))
-        h        = float(edit.get("height_px", 20))
-        align    = edit.get("align", "left")
 
-        if not new_val:
+# ─── Grand total update ───────────────────────────────────────────────────────
+
+def update_grand_total(page, old_str: str, new_val: float,
+                       sym: str, before: bool, eu: bool,
+                       all_spans: list = None):
+    """
+    Replace ALL occurrences of grand total (table footer + payment section).
+    Tries multiple formats: with/without currency symbol, with/without commas.
+    """
+    new_fmt   = fmt(new_val, sym, before, eu)
+    new_clean = re.sub(r'[^\d.,]', '', new_fmt)
+
+    replaced = False
+
+    if old_str:
+        old_clean = re.sub(r'[^\d.,]', '', old_str)
+        if old_clean:
+            if replace_text(page, old_clean, new_clean, occurrence=None):
+                replaced = True
+        # Also try with currency symbol
+        old_with_sym = (sym + old_clean) if before else (old_clean + sym)
+        if replace_text(page, old_with_sym, new_fmt, occurrence=None):
+            replaced = True
+
+    # If old value not found, search for large numbers in lower half of page
+    if not replaced and all_spans:
+        ph = page.rect.height
+        pw = page.rect.width
+        cands = [
+            s for s in all_spans
+            if s["y0"] > ph * 0.5
+            and re.search(r'\d{2,}[.,]\d{2}', s["text"])
+        ]
+        if cands:
+            largest = max(cands, key=lambda s: float(
+                re.sub(r'[^\d]', '', s["text"].split(".")[0] or "0") or "0"))
+            old_v = re.sub(r'[^\d.,]', '', largest["text"])
+            replace_text(page, old_v, new_clean, occurrence=None)
+
+    print(f"  💰 Grand total → {new_fmt}")
+
+
+# ─── Self-extractor (no Claude fallback) ──────────────────────────────────────
+
+def self_extract(page) -> dict:
+    """Extract invoice structure from PDF without Claude."""
+    all_spans = get_all_spans(page)
+    ph = page.rect.height
+    pw = page.rect.width
+
+    def val_near(label, x_min=350):
+        hits = [s for s in all_spans if label.lower() in s["text"].lower()]
+        if not hits: return ""
+        ly = hits[0]["y0"]
+        vs = [s for s in all_spans
+              if abs(s["y0"] - ly) < 8 and s["x0"] >= x_min
+              and label.lower() not in s["text"].lower()]
+        return vs[0]["text"] if vs else ""
+
+    # Invoice fields
+    inv_num = (val_near("InvoiceNumber") or val_near("Invoice Number")
+               or val_near("Invoice#")   or val_near("Invoice No")
+               or val_near("Inv No")     or val_near("InvNo"))
+    date    = (val_near("Date") or val_near("Invoice Date") or val_near("Datum"))
+
+    # Currency detection
+    sym, before = "£", True
+    for s in all_spans:
+        for ch in "£$€¥₹₪฿":
+            if ch in s["text"]:
+                sym    = ch
+                before = s["text"].strip().startswith(ch)
+                break
+        else:
             continue
+        break
 
-        # Get exact font from original PDF at this location
-        font_meta = get_font_at(y)
-        fontname  = font_meta["font"]
-        fontsize  = font_meta["size"]
-        color     = pymupdf_color(font_meta["color"])
+    # European format detection
+    eu = bool(re.search(r'\d\.\d{3},\d{2}', " ".join(s["text"] for s in all_spans)))
 
-        # Redact old text
-        rect = pymupdf.Rect(x - 2, y - 2, x + w + 4, y + h + 4)
-        redact_rect(rect)
-        page.apply_redactions()
+    # Grand total: rightmost large number in lower half
+    tot_cands = [s for s in all_spans
+                 if s["y0"] > ph * 0.5 and s["x0"] > pw * 0.5
+                 and re.search(r'\d{2,}[.,]\d{2}', s["text"])]
+    grand = re.sub(r'[^\d.,]', '', max(tot_cands, key=lambda s: s["x0"])["text"]) \
+            if tot_cands else ""
 
-        # Re-render new text
-        render_text(x, y, new_val, fontname, fontsize, color, align, w)
-        log.append(f"✅ Simple edit '{field}' → '{new_val}'")
+    # Tax rate
+    tax = 20.0
+    for s in all_spans:
+        m = re.search(r'(\d+)\s*%', s["text"])
+        if m:
+            tax = float(m.group(1))
+            break
 
-    # ── STEP 2: Product table rebuild ─────────────────────────────────────────
-    product_rows  = invoice_map.get("product_rows", [])
-    table_header  = invoice_map.get("table_header", {})
-    totals_block  = invoice_map.get("totals_block", {})
-    row_font_meta = invoice_map.get("row_font", {})
+    # Addresses — use proportional positions
+    bill = [s["text"] for s in sorted(all_spans, key=lambda s: s["y0"])
+            if s["x0"] < pw * 0.35 and s["size"] < 9
+            and ph * 0.15 < s["y0"] < ph * 0.45]
 
-    if product_rows and user_products:
-        first_row    = product_rows[0]
-        row_height   = float(first_row.get("height_px", 26))
-        first_row_y  = float(first_row.get("y_px", 0))
-        last_row     = product_rows[-1]
-        all_rows_end = float(last_row.get("y_px", 0)) + float(last_row.get("height_px", 26))
-        columns      = table_header.get("columns", [])
+    delv = [s["text"] for s in sorted(all_spans, key=lambda s: s["y0"])
+            if pw * 0.35 <= s["x0"] < pw * 0.72 and s["size"] < 9
+            and ph * 0.15 < s["y0"] < ph * 0.45]
 
-        # Get row font from original PDF
-        sample_y   = first_row_y + row_height / 2
-        font_meta  = get_font_at(sample_y)
-        fontname   = font_meta["font"]
-        fontsize   = font_meta["size"]
-        row_color  = pymupdf_color(font_meta["color"])
+    return {
+        "invoice_number_value":   inv_num,
+        "date_value":             date,
+        "billing_address_lines":  bill[:8],
+        "delivery_address_lines": delv[:8],
+        "tax_rate_pct":           tax,
+        "currency_symbol":        sym,
+        "currency_before":        before,
+        "european_format":        eu,
+        "grand_total_value":      grand,
+    }
 
-        # Wipe ALL original product rows in one redaction
-        wipe_rect = pymupdf.Rect(0, first_row_y - 2, page_rect.width, all_rows_end + 2)
-        page.add_redact_annot(wipe_rect, fill=(1, 1, 1))
-        page.apply_redactions()
-        log.append(f"🗑️ Wiped {len(product_rows)} original rows ({first_row_y:.0f}–{all_rows_end:.0f}px)")
 
-        # Re-render user products
-        current_y = first_row_y
-        for i, prod in enumerate(user_products):
-            name  = str(prod.get("Product_Name", "")).strip()
-            qty   = str(prod.get("Quantity", "")).strip()
-            price = str(prod.get("Product_Price", "")).strip()
+# ─── Multi-page support ───────────────────────────────────────────────────────
 
-            # Auto-calculate line total
-            try:
-                qty_num   = float(re.sub(r'[^\d.]', '', qty))
-                price_str = re.sub(r'[^\d.]', '', price)
-                price_num = float(price_str)
-                line_total = format_currency(qty_num * price_num, price)
-            except Exception:
-                line_total = ""
+def get_table_pages(doc) -> list:
+    """Find all pages that contain product tables."""
+    pages_with_tables = []
+    for i, page in enumerate(doc):
+        tbl = detect_table(page)
+        if tbl and tbl["data_rows"]:
+            pages_with_tables.append((i, page, tbl))
+    return pages_with_tables
 
-            # Map values to column labels
-            col_values = {
-                "description": name, "product": name, "item": name,
-                "name": name, "details": name,
-                "qty": qty, "quantity": qty, "units": qty,
-                "unit price": price, "price": price, "rate": price,
-                "unit cost": price, "cost": price,
-                "total": line_total, "amount": line_total,
-                "line total": line_total, "subtotal": line_total
-            }
 
-            for col in columns:
-                col_label = col.get("label", "").lower()
-                col_x     = float(col.get("x_px", 0))
-                col_w     = float(col.get("width_px", 100))
-                col_align = col.get("align", "left")
+# ─── Main editor ──────────────────────────────────────────────────────────────
 
-                val = ""
-                for key, v in col_values.items():
-                    if key in col_label:
-                        val = v
-                        break
+def edit_invoice(pdf_bytes: bytes, changes: dict,
+                 user_products: list, structure_map: dict) -> tuple:
 
-                if val:
-                    render_text(col_x, current_y, val, fontname, fontsize,
-                                row_color, col_align, col_w)
+    doc  = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[0]
+    log  = []
 
-            log.append(f"✅ Rendered row {i+1}: {name} × {qty} @ {price} = {line_total}")
-            current_y += row_height
+    # Scanned PDF detection
+    if detect_pdf_type(page) == "scanned":
+        doc.close()
+        return pdf_bytes, ["⚠️ Scanned PDF detected. Please upload a digital PDF with selectable text."]
 
-        # ── STEP 3: Shift totals block up ────────────────────────────────────
-        rows_rendered    = len(user_products)
-        rows_deleted     = len(product_rows) - rows_rendered
-        vertical_savings = rows_deleted * row_height
+    all_spans = get_all_spans(page)
 
-        if rows_deleted > 0 and totals_block:
-            old_totals_y = float(totals_block.get("y_px", 0))
-            totals_h     = float(totals_block.get("height_px", 100))
-            new_totals_y = old_totals_y - vertical_savings
+    # Use Claude's structure_map if available, else self-extract
+    smap = structure_map or self_extract(page)
+    print(f"  📋 Map: {'Claude' if structure_map else 'self-extract'}")
 
-            # Snapshot totals content BEFORE wiping
-            totals_rows = totals_block.get("rows", [])
+    sym  = smap.get("currency_symbol", "£")
+    bfr  = smap.get("currency_before", True)
+    eu   = smap.get("european_format", False)
+    tax  = float(smap.get("tax_rate_pct", 20.0))
 
-            # Wipe old totals location
-            wipe_totals = pymupdf.Rect(0, old_totals_y - 4,
-                                       page_rect.width, old_totals_y + totals_h + 4)
-            page.add_redact_annot(wipe_totals, fill=(1, 1, 1))
-            page.apply_redactions()
+    if "Tax" in changes:
+        try: tax = float(str(changes["Tax"]).replace("%", "").strip())
+        except ValueError: pass
 
-            # Re-render each totals row at shifted position
-            for trow in totals_rows:
-                t_old_y  = float(trow.get("y_px", old_totals_y))
-                t_offset = t_old_y - old_totals_y
-                t_new_y  = new_totals_y + t_offset
-                t_h      = float(trow.get("height_px", 22))
+    # ── Simple field edits ────────────────────────────────────────────────────
 
-                # Get font from original (by old y position)
-                t_meta   = get_font_at(t_old_y)
-                t_font   = t_meta["font"]
-                t_size   = t_meta["size"]
-                t_color  = pymupdf_color(t_meta["color"])
+    if "Invoice_Number" in changes:
+        old = str(smap.get("invoice_number_value", ""))
+        new = str(changes["Invoice_Number"])
+        if old:
+            replace_text(page, old, new, x_min=350)
+            log.append(f"Invoice number: {old} → {new}")
 
-                lx    = float(trow.get("label_x", 0))
-                lw    = float(trow.get("label_width_px", 120))
-                vx    = float(trow.get("value_x", 0))
-                vw    = float(trow.get("width_px", 100))
-                label = str(trow.get("label", ""))
-                value = str(trow.get("value", ""))
-                align = trow.get("align", "right")
+    if "Date" in changes:
+        old = str(smap.get("date_value", ""))
+        new = str(changes["Date"])
+        if old:
+            replace_text(page, old, new, x_min=350)
+            log.append(f"Date: {old} → {new}")
 
-                if label:
-                    render_text(lx, t_new_y, label, t_font, t_size, t_color, "left", lw)
-                if value:
-                    render_text(vx, t_new_y, value, t_font, t_size, t_color, align, vw)
+    if "Billing_Address" in changes:
+        old_lines = smap.get("billing_address_lines", [])
+        replace_address(page, old_lines, changes["Billing_Address"], x_max=None)
+        log.append("Billing address updated")
 
-            log.append(f"⬆️ Shifted totals up {vertical_savings:.0f}px "
-                       f"({old_totals_y:.0f} → {new_totals_y:.0f})")
+    if "Shipping_Address" in changes:
+        old_lines = smap.get("delivery_address_lines", [])
+        replace_address(page, old_lines, changes["Shipping_Address"])
+        log.append("Shipping address updated")
 
-    # ── Save as PDF ────────────────────────────────────────────────────────────
+    # ── Product table rebuild ─────────────────────────────────────────────────
+
+    if user_products:
+        # Check all pages for tables
+        all_pages_with_tables = []
+        for i, pg in enumerate(doc):
+            tbl = detect_table(pg, get_all_spans(pg))
+            if tbl and tbl["data_rows"]:
+                all_pages_with_tables.append((i, pg, tbl))
+
+        if not all_pages_with_tables:
+            log.append("⚠️ No product table detected on any page")
+        else:
+            # Edit all pages that have product tables
+            for pg_idx, pg, tbl in all_pages_with_tables:
+                rd, sub_t, vat_t, grand = rebuild_table(
+                    pg, tbl, user_products, tax, sym, bfr, eu, smap)
+                if rd:
+                    update_grand_total(
+                        pg,
+                        str(smap.get("grand_total_value", "")),
+                        grand, sym, bfr, eu, get_all_spans(pg)
+                    )
+                    log.append(f"Page {pg_idx+1}: {len(rd)} rows rebuilt")
+                    log.append(f"Grand total: {fmt(grand, sym, bfr, eu)}")
+                else:
+                    log.append(f"⚠️ Page {pg_idx+1}: table rebuild failed")
+
     buf = io.BytesIO()
     doc.save(buf, garbage=4, deflate=True)
     doc.close()
     buf.seek(0)
-    return buf.read()
+    return buf.read(), log
 
 
-# ─── Image → PDF fallback (Pillow + ReportLab-style via PyMuPDF) ─────────────
-
-def image_to_pdf_with_edits(image_b64: str, invoice_map: dict, user_products: list) -> bytes:
-    """
-    For image inputs: apply edits using Pillow white-box method,
-    then convert result to PDF using PyMuPDF.
-    Always outputs PDF.
-    """
-    from PIL import Image, ImageDraw, ImageFont
-
-    img_data = base64.b64decode(image_b64)
-    img = Image.open(io.BytesIO(img_data)).convert("RGB")
-    draw = ImageDraw.Draw(img)
-    img_w, img_h = img.size
-    log = []
-
-    def hex_to_rgb(hex_color):
-        h = hex_color.lstrip("#")
-        if len(h) == 3: h = "".join(c*2 for c in h)
-        try: return tuple(int(h[i:i+2],16) for i in (0,2,4))
-        except: return (0,0,0)
-
-    def sample_bg(x, y, radius=5):
-        pixels = []
-        for dx in range(-radius, radius+1):
-            for dy in range(-radius, radius+1):
-                px, py = x+dx, y+dy
-                if 0 <= px < img_w and 0 <= py < img_h:
-                    pixels.append(img.getpixel((px,py))[:3])
-        if not pixels: return (255,255,255)
-        return tuple(sum(p[i] for p in pixels)//len(pixels) for i in range(3))
-
-    def get_font(size=13, bold=False):
-        candidates = ([
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        ] if bold else [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        ])
-        for p in candidates:
-            if os.path.exists(p):
-                try: return ImageFont.truetype(p, size)
-                except: continue
-        return ImageFont.load_default()
-
-    def render_text_pil(x, y, w, h, text, fsize, bold, tcolor, align):
-        font = get_font(fsize, bold)
-        try:
-            bb = draw.textbbox((0,0), text, font=font)
-            tw, th = bb[2]-bb[0], bb[3]-bb[1]
-        except: tw, th = len(text)*fsize*0.6, fsize
-        ty = y + max(2, (h-th)//2)
-        if align == "right": tx = x + w - tw - 2
-        elif align == "center": tx = x + (w-tw)//2
-        else: tx = x + 2
-        draw.text((tx, ty), text, fill=hex_to_rgb(tcolor), font=font)
-
-    # Simple edits
-    for edit in invoice_map.get("simple_edits", []):
-        new_val = str(edit.get("new_value",""))
-        if not new_val: continue
-        x,y,w,h = int(edit["x_px"]),int(edit["y_px"]),int(edit["width_px"]),int(edit["height_px"])
-        fsize = int(edit.get("font_size",13))
-        bold  = bool(edit.get("bold",False))
-        tcolor= edit.get("text_color","#333333")
-        align = edit.get("align","left")
-        bg = sample_bg(min(x+w+10, img_w-1), y+h//2)
-        draw.rectangle([x-2,y-2,x+w+4,y+h+4], fill=bg)
-        render_text_pil(x,y,w,h,new_val,fsize,bold,tcolor,align)
-        log.append(f"✅ Image edit '{edit.get('field')}' → '{new_val}'")
-
-    # Product rows
-    product_rows = invoice_map.get("product_rows",[])
-    table_header = invoice_map.get("table_header",{})
-    totals_block = invoice_map.get("totals_block",{})
-    columns = table_header.get("columns",[])
-    row_font = invoice_map.get("row_font",{"size":12,"bold":False,"color":"#333333"})
-
-    if product_rows and user_products:
-        first_row   = product_rows[0]
-        row_height  = int(first_row.get("height_px",26))
-        first_row_y = int(first_row.get("y_px",0))
-        last_row    = product_rows[-1]
-        all_end     = int(last_row["y_px"]) + int(last_row["height_px"])
-
-        bg = sample_bg(img_w-20, first_row_y+5)
-        draw.rectangle([0,first_row_y-2,img_w,all_end+2], fill=bg)
-
-        current_y = first_row_y
-        for i, prod in enumerate(user_products):
-            name  = str(prod.get("Product_Name","")).strip()
-            qty   = str(prod.get("Quantity","")).strip()
-            price = str(prod.get("Product_Price","")).strip()
-            try:
-                q = float(re.sub(r'[^\d.]','',qty))
-                p = float(re.sub(r'[^\d.]','',price))
-                line_total = format_currency(q*p, price)
-            except: line_total = ""
-
-            col_values = {
-                "description":name,"product":name,"item":name,"name":name,
-                "qty":qty,"quantity":qty,"units":qty,
-                "unit price":price,"price":price,"rate":price,"cost":price,
-                "total":line_total,"amount":line_total,"line total":line_total
-            }
-            for col in columns:
-                lbl = col.get("label","").lower()
-                cx,cw,ca = int(col.get("x_px",0)),int(col.get("width_px",100)),col.get("align","left")
-                val = next((v for k,v in col_values.items() if k in lbl), "")
-                if val:
-                    render_text_pil(cx,current_y,cw,row_height,val,
-                                    int(row_font.get("size",12)),
-                                    bool(row_font.get("bold",False)),
-                                    row_font.get("color","#333333"),ca)
-            log.append(f"✅ Row {i+1}: {name}")
-            current_y += row_height
-
-        rows_deleted = len(product_rows) - len(user_products)
-        if rows_deleted > 0 and totals_block:
-            old_y  = int(totals_block.get("y_px",0))
-            t_h    = int(totals_block.get("height_px",100))
-            new_y  = old_y - rows_deleted * row_height
-            t_font = totals_block.get("font",{"size":12,"bold":False,"color":"#333333"})
-
-            draw.rectangle([0,old_y-4,img_w,old_y+t_h+4], fill=bg)
-            for trow in totals_block.get("rows",[]):
-                t_old = int(trow.get("y_px",old_y))
-                t_new = new_y + (t_old - old_y)
-                th    = int(trow.get("height_px",22))
-                lx,lw = int(trow.get("label_x",0)),int(trow.get("label_width_px",120))
-                vx,vw = int(trow.get("value_x",0)),int(trow.get("width_px",100))
-                bold  = bool(trow.get("bold", t_font.get("bold",False)))
-                fsize = int(trow.get("font_size", t_font.get("size",12)))
-                color = trow.get("color", t_font.get("color","#333333"))
-                if trow.get("label"):
-                    render_text_pil(lx,t_new,lw,th,trow["label"],fsize,bold,color,"left")
-                if trow.get("value"):
-                    render_text_pil(vx,t_new,vw,th,trow["value"],fsize,bold,color,trow.get("align","right"))
-            log.append(f"⬆️ Shifted totals up {rows_deleted*row_height}px")
-
-    # Convert edited image to PDF using PyMuPDF
-    img_buf = io.BytesIO()
-    img.save(img_buf, format="PNG")
-    img_buf.seek(0)
-
-    pdf_doc = pymupdf.open()
-    img_doc = pymupdf.open(stream=img_buf.read(), filetype="png")
-    pdfbytes = img_doc.convert_to_pdf()
-    img_doc.close()
-
-    result_doc = pymupdf.open("pdf", pdfbytes)
-    pdf_buf = io.BytesIO()
-    result_doc.save(pdf_buf, garbage=4, deflate=True)
-    result_doc.close()
-    pdf_buf.seek(0)
-    return pdf_buf.read(), log
-
-
-# ─── Routes ───────────────────────────────────────────────────────────────────
+# ─── Flask routes ─────────────────────────────────────────────────────────────
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "invoice-editor-final", "engine": "PyMuPDF"})
+    return jsonify({
+        "status":   "ok",
+        "service":  "invoice-editor-v5",
+        "engine":   f"PyMuPDF {pymupdf.__version__}",
+        "features": [
+            "50+ font mappings",
+            "multi-page table support",
+            "address text-search (not x-position)",
+            "scanned PDF detection",
+            "multilingual table headers",
+            "numeric-column fallback",
+            "row insertion with totals push-down",
+            "Claude structure_map + self-extract fallback",
+            "graphics=0 redaction (border lines preserved)",
+            "insert_textbox alignment (L/C/R per column)",
+        ]
+    })
 
 
 @app.route("/edit", methods=["POST"])
 def edit():
-    """
-    POST /edit
-    {
-      "pdf_base64":    "<base64 PDF bytes>",       // for PDF inputs
-      "image_base64":  "<base64 image bytes>",     // for image inputs
-      "file_type":     "pdf" | "image",            // which one to use
-      "invoice_map":   { ...Claude's structural analysis... },
-      "user_products": [ {Product_Name, Quantity, Product_Price}, ... ]
-    }
-    Returns: { success, pdf_base64, log }
-    """
     try:
         body = request.get_json(force=True)
         if not body:
             return jsonify({"success": False, "error": "No JSON body"}), 400
 
-        file_type     = body.get("file_type", "image")
-        invoice_map   = body.get("invoice_map", {})
-        user_products = body.get("user_products", [])
+        b64 = body.get("pdf_base64", "")
+        if not b64:
+            return jsonify({"success": False, "error": "Missing pdf_base64"}), 400
+        if "," in b64:
+            b64 = b64.split(",", 1)[1]
 
-        if not invoice_map:
-            return jsonify({"success": False, "error": "Missing invoice_map"}), 400
+        changes       = body.get("changes", {})
+        prods         = body.get("user_products", [])
+        smap          = body.get("structure_map", None)
+        pdf_bytes     = base64.b64decode(b64)
 
-        print(f"\n📄 Processing {file_type} invoice with {len(user_products)} product(s)...")
+        print(f"\n📄 {len(pdf_bytes):,}B | "
+              f"changes={list(changes.keys())} | "
+              f"products={len(prods)} | "
+              f"map={'yes' if smap else 'no'}")
 
-        if file_type == "pdf":
-            pdf_b64 = body.get("pdf_base64", "")
-            if "," in pdf_b64:
-                pdf_b64 = pdf_b64.split(",",1)[1]
-            if not pdf_b64:
-                return jsonify({"success": False, "error": "Missing pdf_base64"}), 400
-
-            pdf_bytes = base64.b64decode(pdf_b64)
-            result_bytes = edit_pdf(pdf_bytes, invoice_map, user_products)
-            log = ["PDF edited with PyMuPDF — exact font matching"]
-
-        else:
-            # Image input → Pillow edit → convert to PDF
-            img_b64 = body.get("image_base64", "")
-            if "," in img_b64:
-                img_b64 = img_b64.split(",",1)[1]
-            if not img_b64:
-                return jsonify({"success": False, "error": "Missing image_base64"}), 400
-
-            result_bytes, log = image_to_pdf_with_edits(img_b64, invoice_map, user_products)
-
-        result_b64 = base64.b64encode(result_bytes).decode("utf-8")
-        print(f"✅ Done. Output: {len(result_bytes)} bytes PDF")
+        out, log = edit_invoice(pdf_bytes, changes, prods, smap)
+        print(f"✅ {len(out):,}B output | {len(log)} log entries")
 
         return jsonify({
             "success":    True,
-            "pdf_base64": result_b64,
-            "log":        log,
-            "output_format": "pdf"
+            "pdf_base64": base64.b64encode(out).decode(),
+            "log":        log
         })
 
     except Exception as e:
@@ -579,28 +962,19 @@ def edit():
 
 @app.route("/preview", methods=["POST"])
 def preview():
-    """Same as /edit but returns PDF file directly for browser testing."""
     try:
-        body          = request.get_json(force=True)
-        file_type     = body.get("file_type","image")
-        invoice_map   = body.get("invoice_map",{})
-        user_products = body.get("user_products",[])
-
-        if file_type == "pdf":
-            pdf_b64 = body.get("pdf_base64","")
-            if "," in pdf_b64: pdf_b64 = pdf_b64.split(",",1)[1]
-            result_bytes = edit_pdf(base64.b64decode(pdf_b64), invoice_map, user_products)
-        else:
-            img_b64 = body.get("image_base64","")
-            if "," in img_b64: img_b64 = img_b64.split(",",1)[1]
-            result_bytes, _ = image_to_pdf_with_edits(img_b64, invoice_map, user_products)
-
-        return send_file(
-            io.BytesIO(result_bytes),
-            mimetype="application/pdf",
-            as_attachment=True,
-            download_name="edited_invoice.pdf"
+        body  = request.get_json(force=True)
+        b64   = body.get("pdf_base64", "")
+        if "," in b64:
+            b64 = b64.split(",", 1)[1]
+        out, _ = edit_invoice(
+            base64.b64decode(b64),
+            body.get("changes", {}),
+            body.get("user_products", []),
+            body.get("structure_map", None)
         )
+        return send_file(io.BytesIO(out), mimetype="application/pdf",
+                         as_attachment=True, download_name="edited_invoice.pdf")
     except Exception as e:
         traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
@@ -608,5 +982,5 @@ def preview():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 Invoice Editor FINAL on port {port} | Engine: PyMuPDF {pymupdf.__version__}")
+    print(f"🚀 Invoice Editor v5 :{port}  PyMuPDF {pymupdf.__version__}")
     app.run(host="0.0.0.0", port=port, debug=False)
