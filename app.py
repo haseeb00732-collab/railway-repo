@@ -182,12 +182,14 @@ def rgb(color_int: int) -> tuple:
             ( color_int        & 0xFF) / 255)
 
 
-def fmt(value: float, sym: str = "£", before: bool = True, eu: bool = False) -> str:
-    """Format number matching invoice currency style."""
+def fmt(value: float, sym: str = "", before: bool = True, eu: bool = False) -> str:
+    """Format number matching invoice currency style. sym='' means plain number."""
     if eu:
         s = f"{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     else:
         s = f"{value:,.2f}"
+    if not sym:
+        return s
     return (sym + s) if before else (s + sym)
 
 
@@ -616,16 +618,63 @@ def rebuild_table(page, tbl: dict, user_products: list,
     page.apply_redactions(graphics=0)
     print(f"  🧹 Erased {len(rows)} rows (y={y0_erase:.0f}→{y1_erase:.0f})")
 
-    # ── 4. Build column bounding boxes ────────────────────────────────────────
+    # ── 4. Detect whether table rows use currency symbol ─────────────────────
+    # BUG FIX: original Wilkinson invoice uses plain numbers (800.00) in table
+    # rows — no £ symbol. The £ only appears in Payment Details section.
+    # We detect this by sampling actual data row spans.
+    table_uses_sym = False
+    for row_data in rows[:3]:  # check first 3 rows
+        for s in row_data["spans"]:
+            if any(ch in s["text"] for ch in "£$€¥₹₪฿"):
+                table_uses_sym = True
+                break
+    table_sym   = sym   if table_uses_sym else ""
+    table_before = before if table_uses_sym else True
+    print(f"  💱 Table currency: {'with symbol ' + sym if table_uses_sym else 'plain numbers (no symbol)'}")
+
+    # ── 5. Build ACCURATE column boundaries from ACTUAL data positions ────────
+    # BUG FIX: col_spans use header text x0 which is the label's left edge
+    # (headers are center-aligned, so their x0 ≠ true column left boundary).
+    # Instead derive column left boundaries from where actual data values sit.
+    #
+    # Strategy: collect all span x0 values from first 2 data rows, cluster
+    # them into column buckets, sort ascending → these are the true col starts.
+
+    data_x_positions = []
+    for row_data in rows[:min(3, len(rows))]:
+        for s in row_data["spans"]:
+            data_x_positions.append(s["x0"])
+
+    # Cluster x positions (within 8px = same column)
+    data_x_positions.sort()
+    col_starts = []
+    for xp in data_x_positions:
+        if not col_starts or xp - col_starts[-1] > 8:
+            col_starts.append(xp)
+
+    # Also include header x positions for columns with no data (e.g. SKU)
+    for cs in col_spans:
+        if not any(abs(cs["x0"] - cx) < 8 for cx in col_starts):
+            col_starts.append(cs["x0"])
+    col_starts.sort()
+
+    # Match each column header label to its nearest col_start
     n = len(col_spans)
     col_rects = []
-    for i, cs in enumerate(col_spans):
-        x_left  = cs["x0"]
-        x_right = (col_spans[i+1]["x0"] - 1) if i+1 < n else page_w - 20
-        label   = cs["text"].lower().replace(" ", "").replace(".", "")
-        col_rects.append((x_left, x_right, label))
+    used_starts = set()
 
-    # ── 5. Draw new rows ──────────────────────────────────────────────────────
+    for i, cs in enumerate(col_spans):
+        label = cs["text"].lower().replace(" ", "").replace(".", "")
+        # Find nearest col_start to this header's x0
+        nearest = min(col_starts, key=lambda x: abs(x - cs["x0"]))
+        # Get the right boundary = next col_start or page edge
+        nearest_idx = col_starts.index(nearest)
+        x_right = (col_starts[nearest_idx + 1] - 1) if nearest_idx + 1 < len(col_starts) else page_w - 15
+        col_rects.append((nearest, x_right, label))
+
+    print(f"  📐 Column rects: {[(round(xl), round(xr), lbl[:6]) for xl, xr, lbl in col_rects]}")
+
+    # ── 6. Draw new rows ──────────────────────────────────────────────────────
     cur_y = rows[0]["y"]
 
     for ri, row in enumerate(new_rows):
@@ -634,39 +683,45 @@ def rebuild_table(page, tbl: dict, user_products: list,
 
         for xl, xr, label in col_rects:
             # Map label → value + alignment
-            if   any(k in label for k in ("descr","product","item","name","bezeich","artíc","artik","artíc","omschr","towar")):
-                text, align = row["name"], 0
+            if any(k in label for k in ("descr","product","item","name","bezeich","artíc","artik","omschr","towar")):
+                text, align = row["name"], 0  # left
             elif any(k in label for k in ("sku","code","ref","no","num","artikelnr")):
-                text, align = "", 0         # leave blank — don't invent SKUs
-            elif any(k in label for k in ("stat","taken","status")):
+                text, align = "", 0           # blank — don't invent SKUs
+            elif any(k in label for k in ("stat","status")):
                 text, align = row["status"], 1  # center
-            elif any(k in label for k in ("unit","price","rate","preis","prijs","prix","precio","prezzo","cena")) \
-                 and not any(k in label for k in ("total","sub","amount")):
-                text, align = fmt(row["price"], sym, before, eu), 2
-            elif any(k in label for k in ("qty","quan","menge","antal","ilość","amount","units","qté","cant")):
-                text, align = row["qty"], 2
+            elif any(k in label for k in ("unitprice","unitcost","unit","rate","preis","prijs","prix","precio","prezzo","cena")) \
+                 and not any(k in label for k in ("total","sub","amount","gesamt")):
+                text, align = fmt(row["price"], table_sym, table_before, eu), 2  # right
+            elif any(k in label for k in ("qty","quan","menge","antal","ilość","units","qté","cant")):
+                text, align = row["qty"], 2   # right
             elif any(k in label for k in ("sub","subtot","netto","net")):
-                text, align = fmt(row["sub"],   sym, before, eu), 2
+                text, align = fmt(row["sub"],   table_sym, table_before, eu), 2
             elif any(k in label for k in ("vat","tax","steuer","btw","taxe","iva","imposta","podatek","moms")):
-                text, align = fmt(row["vat"],   sym, before, eu), 2
+                text, align = fmt(row["vat"],   table_sym, table_before, eu), 2
             elif any(k in label for k in ("total","amount","gesamt","bedrag","montant","importe","importo","razem","betrag")):
-                text, align = fmt(row["total"], sym, before, eu), 2
+                text, align = fmt(row["total"], table_sym, table_before, eu), 2
             else:
                 text, align = "", 0
 
             if text:
-                tb_rect = pymupdf.Rect(xl + 2, y0 + 1, xr - 2, y1 - 1)
+                # Ensure textbox is wide enough — expand right if needed
+                min_width = len(text) * rs * 0.65
+                actual_xr = max(xr, xl + min_width + 4)
+                # But don't overflow page
+                actual_xr = min(actual_xr, page_w - 8)
+                tb_rect = pymupdf.Rect(xl + 1, y0 + 1, actual_xr - 1, y1 - 1)
                 page.insert_textbox(
                     tb_rect, text,
                     fontname=rf, fontsize=rs, color=rc,
                     align=align
                 )
 
-        print(f"  📝 Row {ri+1}: {row['name'][:35]} | "
-              f"qty={row['qty']} × £{row['price']:.2f} = "
-              f"sub:{fmt(row['sub'],sym,before,eu)} "
-              f"vat:{fmt(row['vat'],sym,before,eu)} "
-              f"total:{fmt(row['total'],sym,before,eu)}")
+        sym_display = table_sym if table_sym else ""
+        print(f"  📝 Row {ri+1}: {row['name'][:30]} | "
+              f"qty={row['qty']} × {sym_display}{row['price']:.2f} = "
+              f"sub:{fmt(row['sub'],table_sym,table_before,eu)} "
+              f"vat:{fmt(row['vat'],table_sym,table_before,eu)} "
+              f"total:{fmt(row['total'],table_sym,table_before,eu)}")
         cur_y += rh
 
     return new_rows, grand_sub, grand_vat, grand_total
@@ -796,39 +851,49 @@ def update_grand_total(page, old_str: str, new_val: float,
                        all_spans: list = None):
     """
     Replace ALL occurrences of grand total (table footer + payment section).
-    Tries multiple formats: with/without currency symbol, with/without commas.
+    Table total: plain number (no symbol) — matches original table format.
+    Payment total: with currency symbol — matches payment section format.
     """
-    new_fmt   = fmt(new_val, sym, before, eu)
-    new_clean = re.sub(r'[^\d.,]', '', new_fmt)
+    # Plain number format (for table area)
+    new_plain = f"{new_val:,.2f}"
+    # With symbol (for payment section)
+    new_with_sym = fmt(new_val, sym, before, eu) if sym else new_plain
 
     replaced = False
 
     if old_str:
-        old_clean = re.sub(r'[^\d.,]', '', old_str)
+        old_clean = re.sub(r'[^\d.,]', '', str(old_str))
         if old_clean:
-            if replace_text(page, old_clean, new_clean, occurrence=None):
+            # Replace plain number occurrences (table footer)
+            if replace_text(page, old_clean, new_plain, occurrence=None):
                 replaced = True
-        # Also try with currency symbol
-        old_with_sym = (sym + old_clean) if before else (old_clean + sym)
-        if replace_text(page, old_with_sym, new_fmt, occurrence=None):
-            replaced = True
+        # Replace symbol+number occurrences (payment section)
+        if sym:
+            old_with_sym = (sym + old_clean) if before else (old_clean + sym)
+            if replace_text(page, old_with_sym, new_with_sym, occurrence=None):
+                replaced = True
 
-    # If old value not found, search for large numbers in lower half of page
+    # Fallback: find largest number in lower half of page
     if not replaced and all_spans:
         ph = page.rect.height
         pw = page.rect.width
-        cands = [
-            s for s in all_spans
-            if s["y0"] > ph * 0.5
-            and re.search(r'\d{2,}[.,]\d{2}', s["text"])
-        ]
-        if cands:
-            largest = max(cands, key=lambda s: float(
-                re.sub(r'[^\d]', '', s["text"].split(".")[0] or "0") or "0"))
-            old_v = re.sub(r'[^\d.,]', '', largest["text"])
-            replace_text(page, old_v, new_clean, occurrence=None)
 
-    print(f"  💰 Grand total → {new_fmt}")
+        def _parse_num(t):
+            try: return float(re.sub(r'[^\d.]', '', t.replace(',','')) or '0')
+            except: return 0.0
+
+        cands = [s for s in all_spans
+                 if s["y0"] > ph * 0.5
+                 and re.search(r'\d{2,}[.,]\d{2}', s["text"])]
+        if cands:
+            largest = max(cands, key=lambda s: _parse_num(s["text"]))
+            old_v   = re.sub(r'[^\d.,]', '', largest["text"])
+            # Check if this span has a symbol prefix
+            has_sym = any(ch in largest["text"] for ch in "£$€¥₹₪฿")
+            replace_text(page, old_v, new_plain if not has_sym else new_with_sym,
+                         occurrence=None)
+
+    print(f"  💰 Grand total → {new_plain} (table) / {new_with_sym} (payment)")
 
 
 # ─── Self-extractor (no Claude fallback) ──────────────────────────────────────
@@ -855,9 +920,12 @@ def self_extract(page) -> dict:
                or val_near("Inv No")     or val_near("InvNo"))
     date    = (val_near("Date") or val_near("Invoice Date") or val_near("Datum"))
 
-    # Currency detection
-    sym, before = "£", True
-    for s in all_spans:
+    # Currency detection — look in PAYMENT SECTION only (lower half of page)
+    # not table rows, because some invoices (e.g. Wilkinson) use plain numbers
+    # in table but £ in payment details
+    sym, before = "", True  # default: no symbol (most common in table rows)
+    payment_spans = [s for s in all_spans if s["y0"] > ph * 0.55]
+    for s in payment_spans:
         for ch in "£$€¥₹₪฿":
             if ch in s["text"]:
                 sym    = ch
@@ -866,6 +934,17 @@ def self_extract(page) -> dict:
         else:
             continue
         break
+    # Fallback: if not found in payment section, check whole page
+    if not sym:
+        for s in all_spans:
+            for ch in "£$€¥₹₪฿":
+                if ch in s["text"]:
+                    sym    = ch
+                    before = s["text"].strip().startswith(ch)
+                    break
+            else:
+                continue
+            break
 
     # European format detection
     eu = bool(re.search(r'\d\.\d{3},\d{2}', " ".join(s["text"] for s in all_spans)))
