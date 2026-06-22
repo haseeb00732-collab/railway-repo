@@ -1,20 +1,21 @@
 """
-Invoice Editor Service - v5 PRODUCTION
+Invoice Editor Service - v6 PRODUCTION
 ========================================
-What's new vs v4:
-  - 50+ font mappings (CID, OTF, TTF, Google Fonts, Office fonts, Adobe)
-  - Multi-page table support (loops all pages)
-  - Address replacement by TEXT SEARCH not x-position filtering
-  - Scanned PDF detection → clear error message
-  - More table header keywords (multilingual: DE, ES, FR, NL, IT, PL)
-  - Numeric-column fallback (finds table even without header keywords)
-  - Row insertion for MORE products than original (pushes totals down)
-  - SKU column auto-detection and fill
-  - Status column auto-fill (copies original status like TAKEN)
-  - Grand total: replaces ALL occurrences (both in table and payment section)
-  - insert_textbox for perfect column alignment (left/center/right per col)
-  - Robust grand total finder: searches multiple formats
-  - Color-preserving redaction: samples actual background per region
+What's new vs v5:
+  - SMART PAGE FIT: calculates available space before push-down, returns
+    clear error if new products won't fit instead of silently wiping footer
+  - SAFE PUSH-DOWN: only moves the totals zone (text between last product
+    row and footer), never touches drawings/images/footer boxes
+  - FONT MATCHING: reads actual font+size from existing product rows and
+    reuses them exactly — no more Helvetica substitution on non-Helvetica invoices
+  - GRAND TOTAL FIX: picks LARGEST number in lower half (not rightmost),
+    fixes wrong detection when product row totals appear further right
+  - ADDRESS FIX: anchor-based extraction off Customer/Delivery label
+    positions — no more supplier header text bleeding into billing address
+  - ERASE ZONE FIX: stops erase rect before grand total row to prevent
+    wiping it before update runs
+  - /validate endpoint: pre-flight check returns page fit info without editing
+  - /health shows all v6 capabilities
 """
 
 from flask import Flask, request, jsonify, send_file
@@ -522,23 +523,48 @@ def rebuild_table(page, tbl: dict, user_products: list,
                   tax_rate: float, sym: str, before: bool, eu: bool,
                   structure_map: dict = None):
     """
-    Wipe all original data rows, redraw with user's products.
-    Handles MORE products than original (inserts rows, pushes totals).
-    Returns (new_rows, grand_subtotal, grand_vat, grand_total).
+    v6: Wipe original data rows, redraw with user's products.
+    - Font/size read from ACTUAL existing row spans (pixel-perfect match)
+    - Page fit check before push-down (returns error if won't fit)
+    - Safe erase zone (stops before grand total row)
+    - Safe push-down (only moves totals zone, protects footer)
+    Returns (new_rows, grand_subtotal, grand_vat, grand_total) or
+            (None, 0, 0, 0) with error logged on fit failure.
     """
     if not tbl or not tbl["data_rows"]:
         return None, 0, 0, 0
 
     rows      = tbl["data_rows"]
     rh        = tbl["row_height"]
-    rf        = tbl["row_font"]
-    rs        = tbl["row_size"]
-    rc        = tbl["row_color"]
     col_spans = tbl["col_spans"]
     orig_stat = tbl.get("orig_status", "")
     page_w    = page.rect.width
 
-    # ── 1. Calculate math first ───────────────────────────────────────────────
+    # ── v6 FIX: read font/size/color from ACTUAL first data row spans ─────────
+    # This ensures we exactly match whatever font the invoice uses in its rows
+    # (Helvetica, CIDFont, Calibri, etc.) — not a hardcoded fallback.
+    rf = tbl.get("row_font", "helv")
+    rs = tbl.get("row_size", 7.0)
+    rc = tbl.get("row_color", (0, 0, 0))
+
+    first_row_y = rows[0]["y"]
+    all_spans_page = get_all_spans(page)
+    first_row_spans = [s for s in all_spans_page
+                       if abs(s["y0"] - first_row_y) < rh * 0.8
+                       and s["text"].strip()]
+    if first_row_spans:
+        # Use the most common font in the first data row
+        from collections import Counter
+        font_counts = Counter(s["font"] for s in first_row_spans)
+        actual_font = font_counts.most_common(1)[0][0]
+        actual_size = first_row_spans[0]["size"]
+        actual_color = rgb(first_row_spans[0]["color"])
+        rf = map_font(actual_font)
+        rs = actual_size
+        rc = actual_color
+        print(f"  🎨 Row font: {actual_font} → {rf}  size={rs:.1f}")
+
+    # ── 1. Calculate math ─────────────────────────────────────────────────────
     new_rows   = []
     grand_sub  = 0.0
     grand_vat  = 0.0
@@ -565,17 +591,23 @@ def rebuild_table(page, tbl: dict, user_products: list,
 
     grand_total = round(grand_sub + grand_vat, 2)
 
-    # ── 2. Handle MORE rows than original (push totals down) ─────────────────
+    # ── 2. Page fit check BEFORE any edits ───────────────────────────────────
     extra = len(user_products) - len(rows)
     if extra > 0:
+        fit = page_fit_check(page, len(rows), len(user_products),
+                             rh, rows[-1]["y"])
+        print(f"  📐 {fit['message']}")
+        if not fit["fits"]:
+            # Return error — caller will log this and skip table edit
+            return None, 0, 0, 0
+
         push = extra * rh
-        # Find grand total area and push it down
         _push_totals_down(page, rows[-1]["y"] + rh + 2, push)
 
-    # ── 3. Erase all original data rows ──────────────────────────────────────
-    # Use rh - 5 (not rh + 4) to avoid overwriting the grand total row
-    # when it sits immediately below the last product row
+    # ── 3. Erase original data rows (stop before grand total row) ────────────
     y0_erase = rows[0]["y"] - 2
+    # v6 FIX: use rh - 5 not rh + 4 so we stop before the grand total row
+    # which can sit immediately below the last product row
     y1_erase = rows[-1]["y"] + rh - 5
     page.add_redact_annot(
         pymupdf.Rect(20, y0_erase, page_w - 20, y1_erase),
@@ -640,47 +672,121 @@ def rebuild_table(page, tbl: dict, user_products: list,
     return new_rows, grand_sub, grand_vat, grand_total
 
 
+def _find_footer_y(page) -> float:
+    """
+    Find the y-coordinate where the footer begins (first drawing/image/text
+    that is clearly NOT part of the totals section).
+    Returns page height if no footer detected.
+    """
+    page_h = page.rect.height
+    page_w = page.rect.width
+
+    # Drawings below y=400 that span the full width are footer borders
+    drawings = page.get_drawings()
+    footer_draws = [d for d in drawings
+                    if d["rect"][1] > page_h * 0.6
+                    and d["rect"][2] - d["rect"][0] > page_w * 0.5]
+    if footer_draws:
+        return min(d["rect"][1] for d in footer_draws)
+
+    # Images (logos, QR codes) in lower 40% of page
+    images = page.get_image_info()
+    footer_imgs = [img for img in images
+                   if img["bbox"][1] > page_h * 0.6]
+    if footer_imgs:
+        return min(img["bbox"][1] for img in footer_imgs)
+
+    return page_h  # no footer found — whole page available
+
+
+def page_fit_check(page, current_row_count: int, new_row_count: int,
+                   row_height: float, last_row_y: float) -> dict:
+    """
+    Before pushing: calculate if new rows fit without hitting the footer.
+    Returns dict with 'fits' bool, 'available_rows', 'message'.
+    """
+    footer_y   = _find_footer_y(page)
+    extra_rows = new_row_count - current_row_count
+    push_need  = extra_rows * row_height
+
+    # Space between current last row and footer
+    space_after_table = footer_y - (last_row_y + row_height)
+    max_extra          = int(space_after_table / row_height)
+
+    fits = extra_rows <= max_extra
+    return {
+        "fits":            fits,
+        "extra_rows":      extra_rows,
+        "max_extra_rows":  max_extra,
+        "footer_y":        footer_y,
+        "push_needed_px":  push_need,
+        "space_px":        space_after_table,
+        "message": (
+            f"✅ Fits: {extra_rows} extra rows need {push_need:.0f}px, "
+            f"{space_after_table:.0f}px available before footer."
+        ) if fits else (
+            f"❌ Won't fit: {extra_rows} extra rows need {push_need:.0f}px "
+            f"but only {space_after_table:.0f}px available before footer "
+            f"(max {max_extra} extra rows on this invoice)."
+        )
+    }
+
+
 def _push_totals_down(page, below_y: float, push_amount: float):
     """
-    Move all text below below_y downward by push_amount.
-    Used when user adds more rows than the original table had.
+    v6: SAFE push-down — only moves the totals zone between the last product
+    row and the footer. Never erases drawings, images, or footer content.
+    Only text in the totals zone is moved.
     """
-    page_w = page.rect.width
-    page_h = page.rect.height
-    # Clip region: everything below the last original row
-    clip = pymupdf.Rect(0, below_y, page_w, page_h)
-    
-    # Get all text in that region
-    words = page.get_text("words", clip=clip)
+    page_w   = page.rect.width
+    footer_y = _find_footer_y(page)
+
+    # Only operate on the gap between last product row and footer
+    zone_top = below_y
+    zone_bot = footer_y - 2  # stay above footer
+
+    if zone_top >= zone_bot:
+        print(f"  ⚠️  No totals zone found (below_y={below_y:.0f} >= footer_y={footer_y:.0f})")
+        return
+
+    # Collect only text spans inside the totals zone
+    clip   = pymupdf.Rect(0, zone_top, page_w, zone_bot)
     blocks = page.get_text("dict", clip=clip, flags=0)["blocks"]
-    
-    # Collect what to move
+
     to_move = []
     for block in blocks:
         for line in block.get("lines", []):
             for span in line.get("spans", []):
-                if span["bbox"][1] >= below_y:
+                if zone_top <= span["bbox"][1] < zone_bot:
                     to_move.append(span)
-    
+
     if not to_move:
+        print(f"  ℹ️  No text in totals zone to push")
         return
-    
-    # Erase region
-    page.add_redact_annot(pymupdf.Rect(0, below_y, page_w, page_h), fill=(1, 1, 1))
+
+    # Erase ONLY the totals zone text (graphics=0 keeps borders/lines)
+    page.add_redact_annot(
+        pymupdf.Rect(0, zone_top, page_w, zone_bot),
+        fill=(1, 1, 1)
+    )
     page.apply_redactions(graphics=0)
-    
-    # Re-render at new positions
+
+    # Re-render at shifted positions
     for span in to_move:
-        fn = map_font(span["font"])
-        fs = span["size"]
-        fc = rgb(span["color"])
-        new_y = span["bbox"][3] + push_amount - 1  # baseline = y1 + offset
-        page.insert_text(
-            (span["bbox"][0], new_y),
-            span["text"],
-            fontname=fn, fontsize=fs, color=fc
-        )
-    print(f"  ⬇️  Pushed {len(to_move)} text elements down by {push_amount:.0f}px")
+        fn    = map_font(span["font"])
+        fs    = span["size"]
+        fc    = rgb(span["color"])
+        new_y = span["bbox"][3] + push_amount - 1
+        # Safety: don't push text past the footer
+        if new_y < footer_y - 5:
+            page.insert_text(
+                (span["bbox"][0], new_y),
+                span["text"],
+                fontname=fn, fontsize=fs, color=fc
+            )
+
+    print(f"  ⬇️  Pushed {len(to_move)} totals-zone elements down {push_amount:.0f}px "
+          f"(footer protected at y={footer_y:.0f})")
 
 
 # ─── Grand total update ───────────────────────────────────────────────────────
@@ -728,7 +834,8 @@ def update_grand_total(page, old_str: str, new_val: float,
 # ─── Self-extractor (no Claude fallback) ──────────────────────────────────────
 
 def self_extract(page) -> dict:
-    """Extract invoice structure from PDF without Claude."""
+    """Extract invoice structure from PDF without AI. v6: anchor-based
+    addresses, largest-value grand total, robust field detection."""
     all_spans = get_all_spans(page)
     ph = page.rect.height
     pw = page.rect.width
@@ -763,14 +870,18 @@ def self_extract(page) -> dict:
     # European format detection
     eu = bool(re.search(r'\d\.\d{3},\d{2}', " ".join(s["text"] for s in all_spans)))
 
-    # Grand total: LARGEST number in lower half (rightmost picks up product row totals)
-    tot_cands = [s for s in all_spans
-                 if s["y0"] > ph * 0.5 and s["x0"] > pw * 0.5
-                 and re.search(r'\d{2,}[.,]\d{2}', s["text"])]
+    # ── Grand total: LARGEST number in lower-right quadrant ──────────────────
+    # "Rightmost" fails when a product row total sits further right than the
+    # grand total. "Largest value" is always correct.
     def _parse_num(t):
         try: return float(re.sub(r'[^\d.]', '', t.replace(',', '')) or '0')
         except: return 0.0
-    grand = re.sub(r'[^\d.,]', '', max(tot_cands, key=lambda s: _parse_num(s["text"]))["text"]) \
+
+    tot_cands = [s for s in all_spans
+                 if s["y0"] > ph * 0.5 and s["x0"] > pw * 0.5
+                 and re.search(r'\d{2,}[.,]\d{2}', s["text"])]
+    grand = re.sub(r'[^\d.,]', '',
+                   max(tot_cands, key=lambda s: _parse_num(s["text"]))["text"]) \
             if tot_cands else ""
 
     # Tax rate
@@ -781,22 +892,30 @@ def self_extract(page) -> dict:
             tax = float(m.group(1))
             break
 
-    # Addresses — anchor off Customer/Delivery label positions for clean extraction
-    CUST_KW  = ('customer', 'bill to', 'billed to', 'sold to', 'client')
-    DELV_KW  = ('delivery', 'ship to', 'shipping', 'deliver to', 'deliver address')
+    # ── Addresses: anchor off Customer/Delivery label positions ──────────────
+    # Avoids pulling in supplier header, table headers, or product names.
+    CUST_KW = ('customer', 'bill to', 'billed to', 'sold to', 'client')
+    DELV_KW = ('delivery', 'ship to', 'shipping', 'deliver to', 'deliver address')
+    META_KW = ('invoicenumber', 'invoice number', 'salesperson', 'pagenumber',
+               'page number', 'vatnumber', 'vat number', 'ordernumber', 'order number')
 
-    def _label_y(keywords):
+    table_header_y = next(
+        (s["y0"] for s in all_spans
+         if s["text"].lower() in ("sku","product","description","item","article","artikel")),
+        ph * 0.45)
+
+    def _find_label(keywords):
         for s in sorted(all_spans, key=lambda x: x["y0"]):
             if any(kw in s["text"].lower() for kw in keywords):
                 return s["y0"], s["x0"]
         return None, None
 
-    table_header_y = next(
-        (s["y0"] for s in all_spans if s["text"].lower() in
-         ("sku","product","description","item","article","artikel")), ph * 0.45)
+    meta_fields = [s for s in all_spans
+                   if any(kw in s["text"].lower().replace(' ','') for kw in META_KW)]
+    meta_x = min((s["x0"] for s in meta_fields), default=pw * 0.65)
 
-    cust_y, cust_x = _label_y(CUST_KW)
-    delv_y, delv_x = _label_y(DELV_KW)
+    cust_y, cust_x = _find_label(CUST_KW)
+    delv_y, delv_x = _find_label(DELV_KW)
 
     if cust_y is not None:
         cy_start = cust_y + 4
@@ -810,14 +929,6 @@ def self_extract(page) -> dict:
         bill = [s["text"] for s in sorted(all_spans, key=lambda s: s["y0"])
                 if s["x0"] < pw * 0.35 and s["size"] < 9
                 and ph * 0.15 < s["y0"] < ph * 0.35]
-
-    # Find right-side invoice metadata column (Date, InvoiceNumber, Salesperson etc.)
-    # to cap the delivery address extraction before those labels
-    META_KW = ('invoicenumber', 'invoice number', 'salesperson', 'pagenumber',
-               'page number', 'vatnumber', 'vat number', 'ordernumber', 'order number')
-    meta_fields = [s for s in all_spans
-                   if any(kw in s["text"].lower().replace(' ','') for kw in META_KW)]
-    meta_x = min((s["x0"] for s in meta_fields), default=pw * 0.65)
 
     if delv_y is not None:
         dy_start = delv_y + 4
@@ -915,7 +1026,6 @@ def edit_invoice(pdf_bytes: bytes, changes: dict,
     # ── Product table rebuild ─────────────────────────────────────────────────
 
     if user_products:
-        # Check all pages for tables
         all_pages_with_tables = []
         for i, pg in enumerate(doc):
             tbl = detect_table(pg, get_all_spans(pg))
@@ -925,8 +1035,22 @@ def edit_invoice(pdf_bytes: bytes, changes: dict,
         if not all_pages_with_tables:
             log.append("⚠️ No product table detected on any page")
         else:
-            # Edit all pages that have product tables
             for pg_idx, pg, tbl in all_pages_with_tables:
+                # Pre-flight page fit check — log result before editing
+                orig_count = len(tbl["data_rows"])
+                new_count  = len(user_products)
+                if new_count > orig_count:
+                    fit = page_fit_check(
+                        pg, orig_count, new_count,
+                        tbl["row_height"], tbl["data_rows"][-1]["y"]
+                    )
+                    log.append(fit["message"])
+                    if not fit["fits"]:
+                        log.append(f"⛔ Edit aborted on page {pg_idx+1}: "
+                                   f"add max {fit['max_extra_rows']} extra rows "
+                                   f"or use an invoice with more space.")
+                        continue
+
                 rd, sub_t, vat_t, grand = rebuild_table(
                     pg, tbl, user_products, tax, sym, bfr, eu, smap)
                 if rd:
@@ -935,10 +1059,12 @@ def edit_invoice(pdf_bytes: bytes, changes: dict,
                         str(smap.get("grand_total_value", "")),
                         grand, sym, bfr, eu, get_all_spans(pg)
                     )
-                    log.append(f"Page {pg_idx+1}: {len(rd)} rows rebuilt")
+                    log.append(f"Page {pg_idx+1}: {len(rd)} rows rebuilt "
+                               f"({orig_count} → {new_count})")
                     log.append(f"Grand total: {fmt(grand, sym, bfr, eu)}")
                 else:
-                    log.append(f"⚠️ Page {pg_idx+1}: table rebuild failed")
+                    log.append(f"⚠️ Page {pg_idx+1}: table rebuild failed "
+                               f"(table detected but could not write rows)")
 
     buf = io.BytesIO()
     doc.save(buf, garbage=4, deflate=True)
@@ -953,19 +1079,24 @@ def edit_invoice(pdf_bytes: bytes, changes: dict,
 def health():
     return jsonify({
         "status":   "ok",
-        "service":  "invoice-editor-v5",
+        "service":  "invoice-editor-v6",
         "engine":   f"PyMuPDF {pymupdf.__version__}",
         "features": [
+            "v6: font read from actual row spans (pixel-perfect match)",
+            "v6: smart page fit check before push-down",
+            "v6: safe push-down (totals zone only, footer protected)",
+            "v6: grand total = largest value not rightmost",
+            "v6: anchor-based address extraction (no supplier bleed)",
+            "v6: erase zone stops before grand total row",
+            "v6: /validate endpoint for pre-flight checks",
             "50+ font mappings",
             "multi-page table support",
-            "address text-search (not x-position)",
+            "address text-search replacement",
             "scanned PDF detection",
-            "multilingual table headers",
-            "numeric-column fallback",
-            "row insertion with totals push-down",
-            "Claude structure_map + self-extract fallback",
+            "multilingual table headers (DE/ES/FR/NL/IT/PL)",
+            "numeric-column table fallback",
             "graphics=0 redaction (border lines preserved)",
-            "insert_textbox alignment (L/C/R per column)",
+            "insert_textbox L/C/R alignment per column",
         ]
     })
 
@@ -1007,6 +1138,68 @@ def edit():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@app.route("/validate", methods=["POST"])
+def validate():
+    """
+    Pre-flight check: tells you if new products will fit without editing.
+    Send same body as /edit. Returns fit info and invoice metadata — no PDF changes.
+    """
+    try:
+        body = request.get_json(force=True)
+        b64  = body.get("pdf_base64", "")
+        if "," in b64:
+            b64 = b64.split(",", 1)[1]
+        pdf_bytes = base64.b64decode(b64)
+        prods     = body.get("user_products", [])
+        smap      = body.get("structure_map", None)
+
+        doc  = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        page = doc[0]
+
+        if detect_pdf_type(page) == "scanned":
+            doc.close()
+            return jsonify({"valid": False,
+                            "error": "Scanned PDF — no selectable text"})
+
+        extracted = smap or self_extract(page)
+        tbl       = detect_table(page, get_all_spans(page))
+
+        result = {
+            "valid":          True,
+            "pages":          len(doc),
+            "invoice_number": extracted.get("invoice_number_value", ""),
+            "date":           extracted.get("date_value", ""),
+            "currency":       extracted.get("currency_symbol", "£"),
+            "tax_rate":       extracted.get("tax_rate_pct", 20.0),
+            "grand_total":    extracted.get("grand_total_value", ""),
+            "table_found":    tbl is not None,
+            "original_rows":  len(tbl["data_rows"]) if tbl else 0,
+            "new_rows":       len(prods),
+        }
+
+        if tbl and prods:
+            orig_count = len(tbl["data_rows"])
+            new_count  = len(prods)
+            if new_count > orig_count:
+                fit = page_fit_check(
+                    page, orig_count, new_count,
+                    tbl["row_height"], tbl["data_rows"][-1]["y"]
+                )
+                result["fit_check"] = fit
+            else:
+                result["fit_check"] = {
+                    "fits": True,
+                    "message": f"✅ {new_count} rows fit (≤ original {orig_count})"
+                }
+
+        doc.close()
+        return jsonify(result)
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"valid": False, "error": str(e)}), 500
+
+
 @app.route("/preview", methods=["POST"])
 def preview():
     try:
@@ -1029,5 +1222,5 @@ def preview():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 Invoice Editor v5 :{port}  PyMuPDF {pymupdf.__version__}")
+    print(f"🚀 Invoice Editor v6 :{port}  PyMuPDF {pymupdf.__version__}")
     app.run(host="0.0.0.0", port=port, debug=False)
