@@ -119,6 +119,12 @@ FONT_MAP = {
     "zapfdingbats":     "helv",
 }
 
+_BOLD_MAP = {"helv": "hebo", "tiro": "tibo", "cour": "cobo"}
+
+def _to_bold(name: str) -> str:
+    return _BOLD_MAP.get(name, "hebo")
+
+
 def map_font(name: str) -> str:
     """Map any PDF font name to closest PyMuPDF built-in."""
     if not name:
@@ -126,17 +132,11 @@ def map_font(name: str) -> str:
     c = (name.lower()
          .replace(" ", "").replace(",", "").replace("+", "")
          .replace("-", "").replace("_", "").replace(".", ""))
-    # Bold check first
-    if any(b in c for b in ("bold", "heavy", "black", "semibold", "demi")):
-        # Check if it's a known bold mapping
-        for k, v in FONT_MAP.items():
-            if k in c:
-                return v  # already mapped to bold variant above
-        return "hebo"
+    is_bold = any(b in c for b in ("bold", "heavy", "black", "semibold", "demi"))
     for k, v in FONT_MAP.items():
         if k in c:
-            return v
-    return "helv"
+            return _to_bold(v) if is_bold else v
+    return "hebo" if is_bold else "helv"
 
 
 # ─── Table header keywords (multilingual) ────────────────────────────────────
@@ -223,12 +223,77 @@ def get_all_spans(page) -> list:
     return spans
 
 
+# ─── Embedded font extraction ─────────────────────────────────────────────────
+
+def extract_page_fonts(page) -> dict:
+    """
+    Extract embedded font bytes from a page, keyed by normalised font name.
+    Returns {normalised_name: font_bytes} for fonts that have extractable data.
+    Subset-embedded fonts (most PDFs) only contain glyphs used in the original
+    document — fine for invoice editing since we reuse the same character set.
+    """
+    doc = page.parent
+    font_cache = {}
+    try:
+        for font in page.get_fonts(full=True):
+            # font tuple: (xref, ext, type, basefont, name, encoding, referencer)
+            xref      = font[0]
+            basefont  = font[3]   # e.g. "ABCDEF+Calibri-Bold"
+            name      = font[4]   # e.g. "Calibri-Bold"
+            if not xref:
+                continue
+            try:
+                font_info = doc.extract_font(xref)
+                # extract_font returns (name, ext, type, content, ...)
+                # content is bytes or None
+                content = font_info[3] if len(font_info) > 3 else None
+                if content and len(content) > 100:   # skip tiny/empty stubs
+                    # Store under multiple keys so lookup is forgiving
+                    for key in (basefont, name, basefont.split("+")[-1]):
+                        if key:
+                            norm = (key.lower()
+                                    .replace(" ", "").replace("-", "")
+                                    .replace("_", "").replace("+", ""))
+                            font_cache[norm] = content
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return font_cache
+
+
+def get_font_for_span(span_font: str, page_font_cache: dict):
+    """
+    Look up extracted font bytes for a span's font name.
+    Returns (fontbuffer_bytes, None) if found (use fontbuffer= kwarg),
+    or (None, mapped_name_str) if not found (use fontname= kwarg).
+    """
+    norm = (span_font.lower()
+            .replace(" ", "").replace("-", "")
+            .replace("_", "").replace("+", "").replace(",", ""))
+    # Direct hit
+    if norm in page_font_cache:
+        return page_font_cache[norm], None
+    # Partial match — find longest key that is a substring of norm
+    best_key = None
+    for k in page_font_cache:
+        if k in norm or norm in k:
+            if best_key is None or len(k) > len(best_key):
+                best_key = k
+    if best_key:
+        return page_font_cache[best_key], None
+    # No match — fall back to PyMuPDF built-in
+    return None, map_font(span_font)
+
+
 # ─── Text replacement ─────────────────────────────────────────────────────────
 
 def replace_text(page, old: str, new: str,
                  x_min=None, x_max=None, y_min=None, y_max=None,
-                 occurrence=0) -> bool:
-    """Find old text in PDF, redact, insert new text with same font."""
+                 occurrence=0, font_cache: dict = None) -> bool:
+    """Find old text in PDF, redact, insert new text with same font.
+    font_cache: output of extract_page_fonts(page) — enables true embedded
+    font reuse instead of PyMuPDF built-in substitution."""
     if not old or not old.strip():
         return False
 
@@ -265,44 +330,113 @@ def replace_text(page, old: str, new: str,
                [rects[min(occurrence, len(rects) - 1)]])
 
     for rect in targets:
-        sp = nearest_span(page, rect)
-        fn = map_font(sp["font"])
-        fs = sp["size"]
-        fc = rgb(sp["color"])
+        sp  = nearest_span(page, rect)
+        fs  = sp["size"]
+        fc  = rgb(sp["color"])
+
+        # ── Font resolution: embedded first, built-in fallback ───────────────
+        fb, fn = get_font_for_span(sp["font"], font_cache or {})
 
         new_str = str(new)
-        # Erase old text — wide enough for new value too
-        erase_w = max(rect.width, len(new_str) * fs * 0.65) + 8
-        er = pymupdf.Rect(rect.x0 - 1, rect.y0 - 1,
-                          rect.x0 + erase_w, rect.y1 + 1)
+        # Erase old text — measure with actual font when possible
+        try:
+            if fb:
+                _f = pymupdf.Font(fontbuffer=fb)
+            else:
+                _f = pymupdf.Font(fn)
+            old_w   = _f.text_length(old, fs)
+            new_w   = _f.text_length(new_str, fs) if new_str else 0
+            erase_w = max(rect.width, old_w, new_w) + 10
+        except Exception:
+            erase_w = max(rect.width, max(len(old), len(new_str)) * fs * 0.6) + 10
+
+        er = pymupdf.Rect(rect.x0 - 2, rect.y0 - 2,
+                          rect.x0 + erase_w, rect.y1 + 2)
         page.add_redact_annot(er, fill=(1, 1, 1))
         page.apply_redactions(graphics=0)  # graphics=0 preserves border lines
 
         if new_str:
-            page.insert_text((rect.x0, rect.y1 - 1), new_str,
-                             fontname=fn, fontsize=fs, color=fc)
-        print(f"  ✅ '{old[:35]}' → '{new_str[:35]}'")
+            if fb:
+                page.insert_text((rect.x0, rect.y1 - 1), new_str,
+                                 fontbuffer=fb, fontsize=fs, color=fc)
+                print(f"  ✅ '{old[:35]}' → '{new_str[:35]}' [embedded font]")
+            else:
+                page.insert_text((rect.x0, rect.y1 - 1), new_str,
+                                 fontname=fn, fontsize=fs, color=fc)
+                print(f"  ✅ '{old[:35]}' → '{new_str[:35]}' [builtin={fn}]")
     return True
 
 
 # ─── Address replacement (text-search based, not x-position) ─────────────────
 
 def replace_address(page, old_lines: list, new_text: str,
-                    x_min=None, x_max=None):
+                    x_min=None, x_max=None, font_cache: dict = None):
     """
-    Replace address lines by searching for each old line text.
-    Uses optional x bounds only to disambiguate billing vs shipping.
+    Block erase the full address bounding box, then reinsert all new lines.
+    Handles old/new line count differences cleanly — no orphaned lines.
+    font_cache: output of extract_page_fonts(page) for embedded font reuse.
     """
     new_lines = [l.strip() for l in
                  str(new_text).replace("\\n", "\n").split("\n")
                  if l.strip()]
+    stripped = [l.strip() for l in old_lines if l.strip()]
+    if not stripped:
+        return
 
-    for i, old_line in enumerate(old_lines):
-        ol = old_line.strip()
-        if not ol:
-            continue
-        nl = new_lines[i] if i < len(new_lines) else ""
-        replace_text(page, ol, nl, x_min=x_min, x_max=x_max, occurrence=0)
+    # Find bounding rects for all old lines
+    all_rects = []
+    anchor_span = None
+    anchor_rect = None
+    for ol in stripped:
+        rects = page.search_for(ol)
+        if x_min is not None:
+            rects = [r for r in rects if r.x0 >= x_min]
+        if x_max is not None:
+            rects = [r for r in rects if r.x1 <= x_max]
+        if rects:
+            if anchor_span is None:
+                anchor_span = nearest_span(page, rects[0])
+                anchor_rect = rects[0]
+            all_rects.extend(rects)
+
+    if not all_rects or anchor_span is None:
+        print(f"  ⚠️  Address block not found on page")
+        return
+
+    # ── Font resolution: embedded first, built-in fallback ───────────────────
+    fb, fn = get_font_for_span(anchor_span["font"], font_cache or {})
+    fs = anchor_span["size"]
+    fc = rgb(anchor_span["color"])
+    lh = fs * 1.45  # line height
+
+    # Bounding box covering all old lines + room for new lines
+    x0 = min(r.x0 for r in all_rects) - 2
+    y0 = min(r.y0 for r in all_rects) - 2
+    x1 = max(r.x1 for r in all_rects) + 60
+    y1 = max(
+        max(r.y1 for r in all_rects),
+        y0 + len(new_lines) * lh
+    ) + 4
+
+    # Erase entire address block
+    page.add_redact_annot(pymupdf.Rect(x0, y0, x1, y1), fill=(1, 1, 1))
+    page.apply_redactions(graphics=0)
+
+    # Reinsert new lines starting at first old line's baseline
+    base_y = anchor_rect.y1 - 1
+    for i, nl in enumerate(new_lines):
+        if fb:
+            page.insert_text(
+                (anchor_rect.x0, base_y + i * lh),
+                nl, fontbuffer=fb, fontsize=fs, color=fc
+            )
+        else:
+            page.insert_text(
+                (anchor_rect.x0, base_y + i * lh),
+                nl, fontname=fn, fontsize=fs, color=fc
+            )
+    font_label = "embedded" if fb else f"builtin={fn}"
+    print(f"  ✅ Address: {len(stripped)} old → {len(new_lines)} new lines [{font_label}]")
 
 
 # ─── Table detection ──────────────────────────────────────────────────────────
@@ -527,6 +661,7 @@ def rebuild_table(page, tbl: dict, user_products: list,
     """
     v6: Wipe original data rows, redraw with user's products.
     - Font/size read from ACTUAL existing row spans (pixel-perfect match)
+    - Embedded font bytes extracted and reused (no Helvetica substitution)
     - Page fit check before push-down (returns error if won't fit)
     - Safe erase zone (stops before grand total row)
     - Safe push-down (only moves totals zone, protects footer)
@@ -542,12 +677,15 @@ def rebuild_table(page, tbl: dict, user_products: list,
     orig_stat = tbl.get("orig_status", "")
     page_w    = page.rect.width
 
-    # ── v6 FIX: read font/size/color from ACTUAL first data row spans ─────────
-    # This ensures we exactly match whatever font the invoice uses in its rows
-    # (Helvetica, CIDFont, Calibri, etc.) — not a hardcoded fallback.
-    rf = tbl.get("row_font", "helv")
+    # ── Extract embedded fonts from page BEFORE any redactions ───────────────
+    font_cache = extract_page_fonts(page)
+    print(f"  🔤 Font cache: {len(font_cache)} embedded fonts extracted")
+
+    # ── Read font/size/color from ACTUAL first data row spans ─────────────────
+    # Resolve to embedded bytes if available, built-in name as fallback.
     rs = tbl.get("row_size", 7.0)
     rc = tbl.get("row_color", (0, 0, 0))
+    actual_font_name = tbl.get("row_font", "helv")  # raw PDF font name
 
     first_row_y = rows[0]["y"]
     all_spans_page = get_all_spans(page)
@@ -555,16 +693,18 @@ def rebuild_table(page, tbl: dict, user_products: list,
                        if abs(s["y0"] - first_row_y) < rh * 0.8
                        and s["text"].strip()]
     if first_row_spans:
-        # Use the most common font in the first data row
         from collections import Counter
-        font_counts = Counter(s["font"] for s in first_row_spans)
-        actual_font = font_counts.most_common(1)[0][0]
-        actual_size = first_row_spans[0]["size"]
-        actual_color = rgb(first_row_spans[0]["color"])
-        rf = map_font(actual_font)
-        rs = actual_size
-        rc = actual_color
-        print(f"  🎨 Row font: {actual_font} → {rf}  size={rs:.1f}")
+        font_counts    = Counter(s["font"] for s in first_row_spans)
+        actual_font_name = font_counts.most_common(1)[0][0]
+        rs             = first_row_spans[0]["size"]
+        rc             = rgb(first_row_spans[0]["color"])
+
+    # Resolve embedded bytes or fall back to mapped built-in name
+    row_fb, row_fn = get_font_for_span(actual_font_name, font_cache)
+    if row_fb:
+        print(f"  🎨 Row font: {actual_font_name} → embedded bytes  size={rs:.1f}")
+    else:
+        print(f"  🎨 Row font: {actual_font_name} → builtin={row_fn}  size={rs:.1f}")
 
     # ── 1. Calculate math ─────────────────────────────────────────────────────
     new_rows   = []
@@ -604,7 +744,7 @@ def rebuild_table(page, tbl: dict, user_products: list,
             return None, 0, 0, 0
 
         push = extra * rh
-        _push_totals_down(page, rows[-1]["y"] + rh + 2, push)
+        _push_totals_down(page, rows[-1]["y"] + rh + 2, push, font_cache)
 
     # ── 3. Erase original data rows (stop before grand total row) ────────────
     y0_erase = rows[0]["y"] - 2
@@ -710,11 +850,18 @@ def rebuild_table(page, tbl: dict, user_products: list,
                 # But don't overflow page
                 actual_xr = min(actual_xr, page_w - 8)
                 tb_rect = pymupdf.Rect(xl + 1, y0 + 1, actual_xr - 1, y1 - 1)
-                page.insert_textbox(
-                    tb_rect, text,
-                    fontname=rf, fontsize=rs, color=rc,
-                    align=align
-                )
+                if row_fb:
+                    page.insert_textbox(
+                        tb_rect, text,
+                        fontbuffer=row_fb, fontsize=rs, color=rc,
+                        align=align
+                    )
+                else:
+                    page.insert_textbox(
+                        tb_rect, text,
+                        fontname=row_fn, fontsize=rs, color=rc,
+                        align=align
+                    )
 
         sym_display = table_sym if table_sym else ""
         print(f"  📝 Row {ri+1}: {row['name'][:30]} | "
@@ -787,110 +934,165 @@ def page_fit_check(page, current_row_count: int, new_row_count: int,
     }
 
 
-def _push_totals_down(page, below_y: float, push_amount: float):
+def _push_totals_down(page, below_y: float, push_amount: float,
+                      font_cache: dict = None):
     """
-    v6: SAFE push-down — only moves the totals zone between the last product
-    row and the footer. Never erases drawings, images, or footer content.
-    Only text in the totals zone is moved.
+    Safe push-down: moves text AND drawings in the totals zone.
+    Collects both before erasing, redraws both shifted down.
+    font_cache: extract_page_fonts() result — must be collected BEFORE this
+    call since redactions will have already run on the product rows by then.
     """
     page_w   = page.rect.width
     footer_y = _find_footer_y(page)
-
-    # Only operate on the gap between last product row and footer
     zone_top = below_y
-    zone_bot = footer_y - 2  # stay above footer
+    zone_bot = footer_y - 2
 
     if zone_top >= zone_bot:
-        print(f"  ⚠️  No totals zone found (below_y={below_y:.0f} >= footer_y={footer_y:.0f})")
+        print(f"  ⚠️  No totals zone (below_y={below_y:.0f} >= footer={footer_y:.0f})")
         return
 
-    # Collect only text spans inside the totals zone
+    # 1. Collect text
     clip   = pymupdf.Rect(0, zone_top, page_w, zone_bot)
     blocks = page.get_text("dict", clip=clip, flags=0)["blocks"]
+    to_move = [
+        span
+        for block in blocks
+        for line in block.get("lines", [])
+        for span in line.get("spans", [])
+        if zone_top <= span["bbox"][1] < zone_bot
+    ]
 
-    to_move = []
-    for block in blocks:
-        for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                if zone_top <= span["bbox"][1] < zone_bot:
-                    to_move.append(span)
+    # 2. Collect drawings BEFORE erase
+    drawings_to_move = [
+        d for d in page.get_drawings()
+        if zone_top <= d["rect"][1] < zone_bot
+    ]
 
-    if not to_move:
-        print(f"  ℹ️  No text in totals zone to push")
+    if not to_move and not drawings_to_move:
+        print(f"  ℹ️  Nothing in totals zone to push")
         return
 
-    # Erase ONLY the totals zone text (graphics=0 keeps borders/lines)
-    page.add_redact_annot(
-        pymupdf.Rect(0, zone_top, page_w, zone_bot),
-        fill=(1, 1, 1)
-    )
+    # 3. Erase zone (graphics=0 removes vector graphics in redact area)
+    page.add_redact_annot(pymupdf.Rect(0, zone_top, page_w, zone_bot), fill=(1, 1, 1))
     page.apply_redactions(graphics=0)
 
-    # Re-render at shifted positions
+    # 4. Redraw text shifted — use embedded font bytes if available
+    _fc = font_cache or {}
     for span in to_move:
-        fn    = map_font(span["font"])
-        fs    = span["size"]
-        fc    = rgb(span["color"])
-        new_y = span["bbox"][3] + push_amount - 1
-        # Safety: don't push text past the footer
+        fb, fn = get_font_for_span(span["font"], _fc)
+        fs     = span["size"]
+        fc     = rgb(span["color"])
+        new_y  = span["bbox"][3] + push_amount - 1
         if new_y < footer_y - 5:
-            page.insert_text(
-                (span["bbox"][0], new_y),
-                span["text"],
-                fontname=fn, fontsize=fs, color=fc
-            )
+            if fb:
+                page.insert_text((span["bbox"][0], new_y), span["text"],
+                                 fontbuffer=fb, fontsize=fs, color=fc)
+            else:
+                page.insert_text((span["bbox"][0], new_y), span["text"],
+                                 fontname=fn, fontsize=fs, color=fc)
 
-    print(f"  ⬇️  Pushed {len(to_move)} totals-zone elements down {push_amount:.0f}px "
-          f"(footer protected at y={footer_y:.0f})")
+    # 5. Redraw vector graphics shifted
+    shape = page.new_shape()
+    for d in drawings_to_move:
+        dy     = push_amount
+        stroke = d.get("color")
+        fill   = d.get("fill")
+        lw     = d.get("width", 1.0)
+        for item in d.get("items", []):
+            kind = item[0]
+            try:
+                if kind == "l":   # line
+                    shape.draw_line(
+                        pymupdf.Point(item[1].x, item[1].y + dy),
+                        pymupdf.Point(item[2].x, item[2].y + dy)
+                    )
+                elif kind == "re":  # rect
+                    r = item[1]
+                    shape.draw_rect(pymupdf.Rect(r.x0, r.y0 + dy, r.x1, r.y1 + dy))
+                elif kind == "c":   # cubic bezier
+                    pts = [pymupdf.Point(p.x, p.y + dy) for p in item[1:5]]
+                    shape.draw_bezier(*pts)
+                elif kind == "qu":  # quad
+                    q = item[1]
+                    shifted = pymupdf.Quad(
+                        pymupdf.Point(q.ul.x, q.ul.y + dy),
+                        pymupdf.Point(q.ur.x, q.ur.y + dy),
+                        pymupdf.Point(q.ll.x, q.ll.y + dy),
+                        pymupdf.Point(q.lr.x, q.lr.y + dy)
+                    )
+                    shape.draw_quad(shifted)
+            except Exception:
+                continue
+        shape.finish(
+            color=stroke, fill=fill, width=lw,
+            stroke_opacity=d.get("opacity", 1.0),
+            fill_opacity=d.get("fill_opacity", 1.0)
+        )
+    shape.commit()
+
+    print(f"  ⬇️  Pushed {len(to_move)} spans + {len(drawings_to_move)} drawings "
+          f"↓{push_amount:.0f}px (footer@{footer_y:.0f})")
 
 
 # ─── Grand total update ───────────────────────────────────────────────────────
 
 def update_grand_total(page, old_str: str, new_val: float,
                        sym: str, before: bool, eu: bool,
-                       all_spans: list = None):
+                       all_spans: list = None,
+                       structure_map: dict = None):
     """
-    Replace ALL occurrences of grand total (table footer + payment section).
-    Table total: plain number (no symbol) — matches original table format.
-    Payment total: with currency symbol — matches payment section format.
+    Replace grand total. Blueprint-first if available, else heuristic fallback.
     """
-    # Plain number format (for table area)
-    new_plain = f"{new_val:,.2f}"
-    # With symbol (for payment section)
-    new_with_sym = fmt(new_val, sym, before, eu) if sym else new_plain
+    # Blueprint-first: check structure_map for grand total field
+    if structure_map:
+        bp = structure_map.get("editing_blueprint", {})
+        for f in bp.get("replaceable_fields", []):
+            if "grand" in f.get("field_id", "").lower() or "total" in f.get("field_id", "").lower():
+                cv = f.get("current_value", "")
+                if cv:
+                    old_str = re.sub(r'[^\d.,]', '', str(cv)) or old_str
+                    break
 
-    replaced = False
+    new_plain    = f"{new_val:,.2f}"
+    new_with_sym = fmt(new_val, sym, before, eu) if sym else new_plain
+    replaced     = False
 
     if old_str:
         old_clean = re.sub(r'[^\d.,]', '', str(old_str))
         if old_clean:
-            # Replace plain number occurrences (table footer)
             if replace_text(page, old_clean, new_plain, occurrence=None):
                 replaced = True
-        # Replace symbol+number occurrences (payment section)
         if sym:
-            old_with_sym = (sym + old_clean) if before else (old_clean + sym)
-            if replace_text(page, old_with_sym, new_with_sym, occurrence=None):
+            old_sym = (sym + old_clean) if before else (old_clean + sym)
+            if replace_text(page, old_sym, new_with_sym, occurrence=None):
                 replaced = True
 
-    # Fallback: find largest number in lower half of page
+    # Heuristic fallback: largest number below last table row, right half of page.
+    # Uses detect_table() to derive the search floor — no hardcoded ph * 0.5.
     if not replaced and all_spans:
-        ph = page.rect.height
         pw = page.rect.width
+        ph = page.rect.height
 
-        def _parse_num(t):
-            try: return float(re.sub(r'[^\d.]', '', t.replace(',','')) or '0')
+        def _parse(t):
+            try:    return float(re.sub(r'[^\d.]', '', t.replace(',', '')) or '0')
             except: return 0.0
 
+        # Derive y floor from actual table position, not a magic percentage
+        _tbl = detect_table(page, all_spans)
+        if _tbl and _tbl["data_rows"]:
+            gt_floor = _tbl["data_rows"][-1]["y"]   # below last product row
+        else:
+            gt_floor = ph * 0.5                      # only if no table found at all
+
         cands = [s for s in all_spans
-                 if s["y0"] > ph * 0.5
+                 if s["y0"] > gt_floor and s["x0"] > pw * 0.5
                  and re.search(r'\d{2,}[.,]\d{2}', s["text"])]
         if cands:
-            largest = max(cands, key=lambda s: _parse_num(s["text"]))
+            largest = max(cands, key=lambda s: _parse(s["text"]))
             old_v   = re.sub(r'[^\d.,]', '', largest["text"])
-            # Check if this span has a symbol prefix
             has_sym = any(ch in largest["text"] for ch in "£$€¥₹₪฿")
-            replace_text(page, old_v, new_plain if not has_sym else new_with_sym,
+            replace_text(page, old_v,
+                         new_with_sym if has_sym else new_plain,
                          occurrence=None)
 
     print(f"  💰 Grand total → {new_plain} (table) / {new_with_sym} (payment)")
@@ -956,8 +1158,15 @@ def self_extract(page) -> dict:
         try: return float(re.sub(r'[^\d.]', '', t.replace(',', '')) or '0')
         except: return 0.0
 
+    # ── Grand total: derive search zone from table detection, not magic % ────
+    tbl_for_gt = detect_table(page, all_spans)
+    if tbl_for_gt and tbl_for_gt["data_rows"]:
+        gt_y_min = tbl_for_gt["data_rows"][-1]["y"]
+    else:
+        gt_y_min = ph * 0.5  # safe fallback
+
     tot_cands = [s for s in all_spans
-                 if s["y0"] > ph * 0.5 and s["x0"] > pw * 0.5
+                 if s["y0"] > gt_y_min and s["x0"] > pw * 0.5
                  and re.search(r'\d{2,}[.,]\d{2}', s["text"])]
     grand = re.sub(r'[^\d.,]', '',
                    max(tot_cands, key=lambda s: _parse_num(s["text"]))["text"]) \
@@ -1005,9 +1214,10 @@ def self_extract(page) -> dict:
                 and s["size"] < 10
                 and not any(kw in s["text"].lower() for kw in CUST_KW)]
     else:
+        # Fallback: left third of page, upper-mid zone
         bill = [s["text"] for s in sorted(all_spans, key=lambda s: s["y0"])
-                if s["x0"] < pw * 0.35 and s["size"] < 9
-                and ph * 0.15 < s["y0"] < ph * 0.35]
+                if s["x0"] < pw * 0.40 and s["size"] < 9
+                and ph * 0.12 < s["y0"] < ph * 0.45]
 
     if delv_y is not None:
         dy_start = delv_y + 4
@@ -1018,9 +1228,10 @@ def self_extract(page) -> dict:
                 and s["size"] < 10
                 and not any(kw in s["text"].lower() for kw in DELV_KW + ('address',))]
     else:
+        # Fallback: centre third of page, upper-mid zone
         delv = [s["text"] for s in sorted(all_spans, key=lambda s: s["y0"])
-                if pw * 0.35 <= s["x0"] < pw * 0.65 and s["size"] < 9
-                and ph * 0.15 < s["y0"] < ph * 0.35]
+                if pw * 0.30 <= s["x0"] < pw * 0.65 and s["size"] < 9
+                and ph * 0.12 < s["y0"] < ph * 0.45]
 
     return {
         "invoice_number_value":   inv_num,
@@ -1063,9 +1274,13 @@ def edit_invoice(pdf_bytes: bytes, changes: dict,
 
     all_spans = get_all_spans(page)
 
+    # ── Extract embedded fonts ONCE, reuse across all edits on this page ──────
+    font_cache = extract_page_fonts(page)
+    print(f"  🔤 Page font cache: {len(font_cache)} embedded fonts")
+
     # Use Claude's structure_map if available, else self-extract
     smap = structure_map or self_extract(page)
-    print(f"  📋 Map: {'Claude' if structure_map else 'self-extract'}")
+    print(f"  📋 Map: {'Claude blueprint' if structure_map else 'self-extract'}")
 
     sym  = smap.get("currency_symbol", "£")
     bfr  = smap.get("currency_before", True)
@@ -1076,30 +1291,59 @@ def edit_invoice(pdf_bytes: bytes, changes: dict,
         try: tax = float(str(changes["Tax"]).replace("%", "").strip())
         except ValueError: pass
 
+    # ── Blueprint field lookup helper ─────────────────────────────────────────
+    # When Claude's editing_blueprint is present, use its field current_values
+    # directly — these are more precise than self_extract heuristics.
+    def _blueprint_value(field_id_fragments: list, fallback: str) -> str:
+        """Return current_value from blueprint field matching any fragment."""
+        bp = smap.get("editing_blueprint", {})
+        for f in bp.get("replaceable_fields", []):
+            fid = f.get("field_id", "").lower()
+            if any(frag in fid for frag in field_id_fragments):
+                cv = str(f.get("current_value", "")).strip()
+                if cv:
+                    return cv
+        return fallback
+
     # ── Simple field edits ────────────────────────────────────────────────────
 
     if "Invoice_Number" in changes:
-        old = str(smap.get("invoice_number_value", ""))
+        old = _blueprint_value(
+            ["invoice_number", "inv_number", "invoiceno", "invoice_no"],
+            str(smap.get("invoice_number_value", ""))
+        )
         new = str(changes["Invoice_Number"])
         if old:
-            replace_text(page, old, new, x_min=350)
+            replace_text(page, old, new, x_min=350, font_cache=font_cache)
             log.append(f"Invoice number: {old} → {new}")
 
     if "Date" in changes:
-        old = str(smap.get("date_value", ""))
+        old = _blueprint_value(
+            ["date", "invoice_date", "invoicedate"],
+            str(smap.get("date_value", ""))
+        )
         new = str(changes["Date"])
         if old:
-            replace_text(page, old, new, x_min=350)
+            replace_text(page, old, new, x_min=350, font_cache=font_cache)
             log.append(f"Date: {old} → {new}")
 
     if "Billing_Address" in changes:
         old_lines = smap.get("billing_address_lines", [])
-        replace_address(page, old_lines, changes["Billing_Address"], x_max=None)
+        # Blueprint override: if billing address lines listed in blueprint
+        bp_bill = _blueprint_value(["billing_address", "bill_to", "customer_address"], "")
+        if bp_bill and not old_lines:
+            old_lines = [l.strip() for l in bp_bill.split("\n") if l.strip()]
+        replace_address(page, old_lines, changes["Billing_Address"],
+                        x_max=None, font_cache=font_cache)
         log.append("Billing address updated")
 
     if "Shipping_Address" in changes:
         old_lines = smap.get("delivery_address_lines", [])
-        replace_address(page, old_lines, changes["Shipping_Address"])
+        bp_ship = _blueprint_value(["shipping_address", "ship_to", "delivery_address"], "")
+        if bp_ship and not old_lines:
+            old_lines = [l.strip() for l in bp_ship.split("\n") if l.strip()]
+        replace_address(page, old_lines, changes["Shipping_Address"],
+                        font_cache=font_cache)
         log.append("Shipping address updated")
 
     # ── Product table rebuild ─────────────────────────────────────────────────
@@ -1136,7 +1380,7 @@ def edit_invoice(pdf_bytes: bytes, changes: dict,
                     update_grand_total(
                         pg,
                         str(smap.get("grand_total_value", "")),
-                        grand, sym, bfr, eu, get_all_spans(pg)
+                        grand, sym, bfr, eu, get_all_spans(pg), smap
                     )
                     log.append(f"Page {pg_idx+1}: {len(rd)} rows rebuilt "
                                f"({orig_count} → {new_count})")
@@ -1297,6 +1541,65 @@ def preview():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/extract", methods=["POST"])
+def extract():
+    """
+    PDF analysis only — no editing, no output PDF.
+    Returns structured data for Claude planning.
+    """
+    try:
+        body = request.get_json(force=True)
+        b64  = body.get("pdf_base64", "")
+        if "," in b64:
+            b64 = b64.split(",", 1)[1]
+
+        doc  = pymupdf.open(stream=base64.b64decode(b64), filetype="pdf")
+        page = doc[0]
+
+        if detect_pdf_type(page) == "scanned":
+            doc.close()
+            return jsonify({"error": "Scanned PDF — no selectable text"}), 422
+
+        all_spans  = get_all_spans(page)
+        tbl        = detect_table(page, all_spans)
+        extracted  = self_extract(page)
+
+        result = {
+            "page": {
+                "width":  round(page.rect.width,  2),
+                "height": round(page.rect.height, 2),
+                "count":  len(doc),
+            },
+            "fonts":  sorted({s["font"] for s in all_spans}),
+            "table": {
+                "found":      tbl is not None,
+                "columns":    [c["text"] for c in tbl["col_spans"]] if tbl else [],
+                "row_count":  len(tbl["data_rows"]) if tbl else 0,
+                "row_height": round(tbl["row_height"], 1) if tbl else 0,
+                "row_font":   tbl.get("row_font", "") if tbl else "",
+                "row_size":   tbl.get("row_size", 0) if tbl else 0,
+            },
+            "extracted": extracted,
+            # Lightweight drawings summary (no raw path items)
+            "drawings": [
+                {
+                    "rect":  [round(v, 1) for v in d["rect"]],
+                    "color": d.get("color"),
+                    "fill":  d.get("fill"),
+                    "width": d.get("width"),
+                }
+                for d in page.get_drawings()
+            ],
+        }
+
+        doc.close()
+        return jsonify(result)
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
